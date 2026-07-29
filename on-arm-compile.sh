@@ -3,7 +3,7 @@ set -euo pipefail
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KERNEL_DIR="$BASE_DIR/san-kernel-4.19"
 TOOLCHAIN_DIR="$BASE_DIR/toolchains/san-gcc/bin"
-DEFCONFIG="lavender-perf_defconfig"  # relative to arch/arm64/configs/
+DEFCONFIG="vendor/lavender-perf_defconfig"  # relative to arch/arm64/configs/
 OUT_DIR="build-lavender"
 
 echo "[on-arm-compile] Checking SAN-GCC toolchain..."
@@ -21,7 +21,7 @@ if [[ ! -d "$KERNEL_DIR" ]]; then
 fi
 
 echo "[on-arm-compile] Defconfig: $DEFCONFIG"
-if [[ ! -f "$KERNEL_DIR/arch/arm64/configs/vendor/$DEFCONFIG" ]]; then
+if [[ ! -f "$KERNEL_DIR/arch/arm64/configs/$DEFCONFIG" ]]; then
     echo "ERROR: Defconfig not found: $DEFCONFIG"
     exit 1
 fi
