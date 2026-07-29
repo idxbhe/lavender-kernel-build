@@ -86,6 +86,7 @@ cat > "$WORK_DIR/anykernel.sh" << 'ANYKERNEL_EOF'
 ## Configured for Redmi Note 7 (lavender) — SDM660/Konkona
 ## Built by SAN kernel project
 ## Device info: mmcblk0p60 (64MB boot), Non-A/B, f2fs /data+/cache
+## Format: Image.gz-dtb (kernel only, NO ramdisk) — use split_boot/flash_boot
 
 ### AnyKernel setup
 # global properties
@@ -124,29 +125,23 @@ PATCH_VBMETA_FLAG=auto;
 . tools/ak3-core.sh;
 
 # boot install
-dump_boot; # unpack ramdisk
+split_boot; # skip ramdisk unpack - kernel has no ramdisk, only Image.gz-dtb
 
 # --- Ramdisk file modifications go here ---
-# Device: lavender (Redmi Note 7)
-# Fstab: /vendor/etc/fstab.qcom (f2fs for /data and /cache)
+# NOTE: This kernel uses Image.gz-dtb format (no ramdisk in boot image).
+# Ramdisk modifications are not possible without repacking boot.img separately.
+# Any fstab/init.rc changes must be done via Magisk module or separate boot.img patch.
 #
-# Example performance patches (uncomment to enable):
-#
-# fstab.qcom — /data: f2fs nosuid,nodev,barrier=1 → f2fs nosuid,nodev,barrier=0,background_gc=on
-# backup_file fstab.qcom;
-# replace_string fstab.qcom "nosuid,nodev,barrier=1" "nosuid,nodev,barrier=0" "nosuid,nodev,barrier=1" "nosuid,nodev,barrier=0" "background_gc=on"
-#
-# fstab.qcom — /cache: f2fs nosuid,nodev,barrier=1 → nosuid,nodev,barrier=0
-# backup_file fstab.qcom;
-# replace_string fstab.qcom "cache" "cache"
-#
-# init.rc — add cgroup mount for CPU control
-# backup_file init.rc;
-# insert_line init.rc "on init" after "start logd" "\tcgroup cpu /dev/cpuset/cpu"
+# If you need ramdisk modifications, you must:
+# 1. Flash stock boot.img first via fastboot
+# 2. Extract ramdisk from stock boot.img
+# 3. Apply changes to ramdisk files
+# 4. Repack boot.img with modified ramdisk + new kernel
+# 5. OR use Magisk to patch boot.img (Magisk will inject its ramdisk)
 
 # --- End ramdisk modifications ---
 
-write_boot;
+flash_boot; # skip ramdisk repack - kernel has no ramdisk
 ## end boot install
 
 
