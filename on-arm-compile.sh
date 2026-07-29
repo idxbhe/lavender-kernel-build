@@ -3,7 +3,7 @@ set -euo pipefail
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KERNEL_DIR="$BASE_DIR/san-kernel-4.19"
 TOOLCHAIN_DIR="$BASE_DIR/toolchains/san-gcc/bin"
-DEFCONFIG="arch/arm64/configs/vendor/lavender-perf_defconfig"
+DEFCONFIG="lavender-perf_defconfig"  # relative to arch/arm64/configs/
 OUT_DIR="build-lavender"
 
 echo "[on-arm-compile] Checking SAN-GCC toolchain..."
@@ -21,12 +21,21 @@ if [[ ! -d "$KERNEL_DIR" ]]; then
 fi
 
 echo "[on-arm-compile] Defconfig: $DEFCONFIG"
-if [[ ! -f "$KERNEL_DIR/$DEFCONFIG" ]]; then
+if [[ ! -f "$KERNEL_DIR/arch/arm64/configs/vendor/$DEFCONFIG" ]]; then
     echo "ERROR: Defconfig not found: $DEFCONFIG"
     exit 1
 fi
 
 cd "$KERNEL_DIR"
+
+echo "[on-arm-compile] Checking basic dependencies..."
+for dep in cpio flex bison bc gcc make; do
+  command -v $dep >/dev/null 2>&1 || echo "WARNING: $dep missing"
+done
+if [[ ! -f "/usr/include/sys/types.h" ]]; then
+    echo "ERROR: /usr/include/sys/types.h missing. SAN-GCC tidak menyediakannya untuk HOST. Install: sudo apt install -y build-essential libc6-dev libncurses-dev libssl-dev bc bison flex libarchive-tools zstd wget curl"
+    exit 1
+fi
 
 echo "[on-arm-compile] Starting non-interactive build..."
 echo "  ARCH=arm64"
