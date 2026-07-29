@@ -32,10 +32,6 @@ echo "[on-arm-compile] Checking basic dependencies..."
 for dep in cpio flex bison bc gcc make; do
   command -v $dep >/dev/null 2>&1 || echo "WARNING: $dep missing"
 done
-if [[ ! -f "/usr/include/sys/types.h" ]]; then
-    echo "ERROR: /usr/include/sys/types.h missing. SAN-GCC tidak menyediakannya untuk HOST. Install: sudo apt install -y build-essential libc6-dev libncurses-dev libssl-dev bc bison flex libarchive-tools zstd wget curl"
-    exit 1
-fi
 
 echo "[on-arm-compile] Starting non-interactive build..."
 echo "  ARCH=arm64"
