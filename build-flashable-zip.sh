@@ -11,7 +11,7 @@ BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KERNEL_DIR="$BASE_DIR/san-kernel-4.19"
 ANYKERNEL_DIR="$BASE_DIR/AnyKernel3"
 WORK_DIR="$BASE_DIR/anykernel-work"
-BUILD_DIR="$BASE_DIR/build-lavender"
+BUILD_DIR="$KERNEL_DIR/build-lavender"
 
 # ---------- color helpers ----------
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
