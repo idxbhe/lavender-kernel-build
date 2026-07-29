@@ -3,7 +3,7 @@ set -euo pipefail
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KERNEL_DIR="$BASE_DIR/san-kernel-4.19"
 TOOLCHAIN_DIR="$BASE_DIR/toolchains/san-gcc/bin"
-DEFCONFIG="arch/arm64/configs/vendor/whyred-perf_defconfig"
+DEFCONFIG="arch/arm64/configs/vendor/lavender-perf_defconfig"
 OUT_DIR="build-lavender"
 
 echo "[on-arm-compile] Checking SAN-GCC toolchain..."
