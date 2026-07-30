@@ -12,10 +12,10 @@ set -euo pipefail
 # ============================================
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-KERNEL_DIR="$BASE_DIR/scarlet-kernel"
+KERNEL_DIR="$BASE_DIR/san-kernel"
 TOOLCHAIN_DIR="$BASE_DIR/toolchains/san-gcc/bin"
 DEFCONFIG="vendor/lavender-perf_defconfig"  # relative to arch/arm64/configs/
-OUT_DIR="build-lavender"
+OUT_DIR="out"
 
 # ============================================
 # Toolchain Configuration

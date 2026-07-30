@@ -6,3 +6,5 @@ info.txt
 toolchains-san-gcc-tree.txt
 toolchains-archive/
 
+.aider*
+*-kernel/
