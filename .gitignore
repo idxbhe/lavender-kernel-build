@@ -5,6 +5,6 @@ san-kernel-4.4/
 info.txt
 toolchains-san-gcc-tree.txt
 toolchains-archive/
-
+flashable/
 .aider*
 *-kernel/
