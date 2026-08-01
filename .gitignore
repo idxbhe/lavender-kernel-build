@@ -8,3 +8,7 @@ toolchains-archive/
 flashable/
 .aider*
 *-kernel/
+getinfo/
+lavender.json
+lavender.log
+san_scripts/

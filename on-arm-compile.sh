@@ -4,7 +4,7 @@ BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KERNEL_DIR="$BASE_DIR/san-kernel-4.19"
 TOOLCHAIN_DIR="$BASE_DIR/toolchains/san-gcc/bin"
 DEFCONFIG="vendor/lavender-perf_defconfig"  # relative to arch/arm64/configs/
-OUT_DIR="build-lavender"
+OUT_DIR="out"
 
 echo "[on-arm-compile] Checking SAN-GCC toolchain..."
 if [[ ! -f "$TOOLCHAIN_DIR/aarch64-linux-gcc" ]]; then
