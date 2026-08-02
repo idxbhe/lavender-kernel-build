@@ -12,3 +12,6 @@ getinfo/
 lavender.json
 lavender.log
 san_scripts/
+*.txt
+*.log
+*.json
