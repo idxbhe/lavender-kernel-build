@@ -453,6 +453,7 @@ printf '[INFO] Building flashable zip: %s\n' "$OUTPUT_ZIP"
 cd "$BUILD_DIR"
 
 # Use zip if available, else Python zipfile
+ZIP_SUCCESS=0
 if command -v zip >/dev/null 2>&1; then
     zip -r9 "$OUTPUT_ZIP" . \
         -x "*.git*" \
@@ -461,21 +462,49 @@ if command -v zip >/dev/null 2>&1; then
         -x "README.md" \
         -x "LICENSE" \
         -x "make-flash*" \
-        2>/dev/null
+        2>/dev/null && ZIP_SUCCESS=1
 else
     python3 -c "
 import zipfile, os, sys
-with zipfile.ZipFile(sys.argv[1], 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
-    for root, dirs, files in os.walk('.'):
-        # Skip excluded dirs
-        dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ('github', '.git')]
-        for f in files:
-            if f.startswith('.') or f in ('README.md', 'LICENSE') or f.startswith('make-flash'):
-                continue
-            filepath = os.path.join(root, f)
-            arcname = os.path.relpath(filepath, '.')
-            zf.write(filepath, arcname)
-" "$OUTPUT_ZIP"
+try:
+    with zipfile.ZipFile(sys.argv[1], 'w', zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as zf:
+        for root, dirs, files in os.walk('.'):
+            # Skip excluded dirs
+            dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ('github', '.git')]
+            for f in files:
+                if f.startswith('.') or f in ('README.md', 'LICENSE') or f.startswith('make-flash'):
+                    continue
+                filepath = os.path.join(root, f)
+                arcname = os.path.relpath(filepath, '.')
+                zf.write(filepath, arcname)
+    print('ZIP_OK')
+except Exception as e:
+    print('ZIP_ERROR: ' + str(e), file=sys.stderr)
+    sys.exit(1)
+" "$OUTPUT_ZIP" && ZIP_SUCCESS=1
+fi
+
+if [ "$ZIP_SUCCESS" -ne 1 ] || [ ! -f "$OUTPUT_ZIP" ]; then
+    printf 'ERROR: Failed to create zip file\n' >&2
+    cd "$SCRIPT_DIR"
+    rm -rf "$BUILD_DIR"
+    exit 1
+fi
+
+# Verify zip is readable
+if command -v zip >/dev/null 2>&1; then
+    zip -T "$OUTPUT_ZIP" >/dev/null 2>&1 || { printf 'ERROR: Zip file verification failed\n' >&2; cd "$SCRIPT_DIR"; rm -rf "$BUILD_DIR"; exit 1; }
+else
+    python3 -c "
+import zipfile, sys
+try:
+    with zipfile.ZipFile(sys.argv[1], 'r', allowZip64=True) as zf:
+        zf.testzip()
+    print('ZIP_VERIFY_OK')
+except Exception as e:
+    print('ZIP_VERIFY_ERROR: ' + str(e), file=sys.stderr)
+    sys.exit(1)
+" "$OUTPUT_ZIP" || { printf 'ERROR: Zip file verification failed\n' >&2; cd "$SCRIPT_DIR"; rm -rf "$BUILD_DIR"; exit 1; }
 fi
 
 # Move zip to original directory
