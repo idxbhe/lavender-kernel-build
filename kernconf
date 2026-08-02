@@ -34,7 +34,6 @@ CRITICAL_CONFIGS = {
 
     # Module support - NO MODULES = wifi/bt/sensors/camera won't work
     'CONFIG_MODULES': 'Loadable module support',
-    'CONFIG_MODVERSIONS': 'Module versioning (CRC)',
     'CONFIG_MODULE_UNLOAD': 'Module unloading',
     'CONFIG_MODULE_FORCE_UNLOAD': 'Force module unload',
     'CONFIG_MODULES_TREE_LOOKUP': 'Module tree lookup',
