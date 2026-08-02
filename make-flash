@@ -21,11 +21,31 @@ set +e
 SCRIPT_PATH="$0"
 SCRIPT_DIR=$(CDPATH= cd "$(dirname "$SCRIPT_PATH")" && pwd)
 
+ONLY_NECESSARY=0
+
+# Parse arguments
+ARGS=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --only-necessary)
+            ONLY_NECESSARY=1
+            shift
+            ;;
+        *)
+            ARGS="$ARGS \"$1\""
+            shift
+            ;;
+    esac
+done
+
+eval "set -- $ARGS"
+
 if [ $# -lt 2 ]; then
-    printf 'Usage: %s <device-json> <kernel-json> [output-zip]\n' "$(basename "$0")" >&2
-    printf '  device-json:  from ./getinfo/get.sh (e.g., lavender.json)\n' >&2
-    printf '  kernel-json:  from ./get-kernel-info.sh (e.g., san-kernel-4.19.json)\n' >&2
-    printf '  output-zip:   optional, default: <device>-<kernel>-YYYYMMDD.zip\n' >&2
+    printf 'Usage: %s <device-json> <kernel-json> [output-zip] [--only-necessary]\n' "$(basename "$0")" >&2
+    printf '  device-json:       from ./getinfo/get.sh (e.g., lavender.json)\n' >&2
+    printf '  kernel-json:       from ./get-kernel-info.sh (e.g., san-kernel-4.19.json)\n' >&2
+    printf '  output-zip:        optional, default: <device>-<kernel>-YYYYMMDD.zip\n' >&2
+    printf '  --only-necessary:  use only essential fields, skip extended validation\n' >&2
     exit 1
 fi
 
@@ -96,9 +116,52 @@ DTBO_IDX=$(jget "$DEVICE_JSON" "dtbo_idx" "")
 DTB_IDX=$(jget "$DEVICE_JSON" "dtb_idx" "")
 DTBO_PARTITION=$(jget "$DEVICE_JSON" "dtbo_partition" "")
 
-# Format patchlevels for AK3 (YYYY-MM)
-SP_YM=$(printf '%s' "$SECURITY_PATCH" | cut -c1-7)
-VSP_YM=$(printf '%s' "$VENDOR_SECURITY_PATCH" | cut -c1-7)
+# Extended fields (used when NOT --only-necessary)
+if [ "$ONLY_NECESSARY" -eq 0 ]; then
+    VENDOR_PRODUCT_DEVICE=$(jget "$DEVICE_JSON" "vendor_product_device" "")
+    # boot_header uses HEADER_VER key (string, may be '0') - extract via Python directly
+    BOOT_HEADER_VERSION=$(python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+bh = d.get('boot_header', {})
+v = bh.get('HEADER_VER', '')
+print(v if v != '' else '')
+" "$DEVICE_JSON")
+    # vendor_boot_header also uses HEADER_VER
+    VENDOR_BOOT_HEADER_VERSION=$(python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+vbh = d.get('vendor_boot_header', {})
+v = vbh.get('HEADER_VER', '')
+print(v if v != '' else '')
+" "$DEVICE_JSON")
+    KERNEL_CMDLINE=$(jget "$DEVICE_JSON" "kernel_cmdline" "")
+else
+    VENDOR_PRODUCT_DEVICE=""
+    BOOT_HEADER_VERSION=""
+    VENDOR_BOOT_HEADER_VERSION=""
+    KERNEL_CMDLINE=""
+fi
+
+# Format patchlevels for AK3 — use prefix match (YYYY-MM-) so any day in that month works
+# If JSON has security_patch_range (e.g., "2024-01-2026-12"), use that instead
+SECURITY_PATCH_RANGE=$(jget "$DEVICE_JSON" "security_patch_range" "")
+VENDOR_PATCH_RANGE=$(jget "$DEVICE_JSON" "vendor_security_patch_range" "")
+
+if [ -n "$SECURITY_PATCH_RANGE" ]; then
+    SP_YM="$SECURITY_PATCH_RANGE"
+else
+    # Prefix match: 2026-03- matches 2026-03-01 through 2026-03-31
+    SP_YM=$(printf '%s' "$SECURITY_PATCH" | cut -c1-7)-
+fi
+
+if [ -n "$VENDOR_PATCH_RANGE" ]; then
+    VSP_YM="$VENDOR_PATCH_RANGE"
+else
+    VSP_YM=$(printf '%s' "$VENDOR_SECURITY_PATCH" | cut -c1-7)-
+fi
 
 # ============================================
 # EXTRACT KERNEL INFO
@@ -134,6 +197,27 @@ APPENDED_DTBS=$(jget "$KERNEL_JSON" "appended_dtb_files" "[]")
 DTB_FILES=$(jget "$KERNEL_JSON" "dtb_files" "[]")
 DTBO_FILES=$(jget "$KERNEL_JSON" "dtbo_files" "[]")
 
+# Extended fields (used when NOT --only-necessary)
+if [ "$ONLY_NECESSARY" -eq 0 ]; then
+    CONFIG_FLAGS=$(jget "$KERNEL_JSON" "config_flags" "{}")
+    KERNEL_VERSION_MAKEFILE=$(jget "$KERNEL_JSON" "kernel_version_makefile" "")
+    KSU_SOURCE_TREE=$(jget "$KERNEL_JSON" "ksu_source_tree" "")
+    LLVM_ENABLED=$(jget_bool "$KERNEL_JSON" "llvm_enabled")
+    SMP=$(jget_bool "$KERNEL_JSON" "smp")
+    PREEMPT_BUILT=$(jget_bool "$KERNEL_JSON" "preempt_built")
+    ZIP_KERNEL_STRING_SUGGEST=$(jget "$KERNEL_JSON" "zip_kernel_string_suggest" "")
+    AK3_REC_KERNEL_COMPRESSION=$(jget "$KERNEL_JSON" "ak3_recommended_kernel_compression" "")
+else
+    CONFIG_FLAGS="{}"
+    KERNEL_VERSION_MAKEFILE=""
+    KSU_SOURCE_TREE=""
+    LLVM_ENABLED=0
+    SMP=0
+    PREEMPT_BUILT=0
+    ZIP_KERNEL_STRING_SUGGEST=""
+    AK3_REC_KERNEL_COMPRESSION=""
+fi
+
 # Source kernel directory (for copying artifacts)
 KSRC=$(jget "$KERNEL_JSON" "source_path" "")
 # Try to find the actual kernel image in the source out/ dir
@@ -162,6 +246,8 @@ if [ -z "$OUTPUT_ZIP" ]; then
     DATE_TAG=$(date +%Y%m%d 2>/dev/null || echo "nodate")
     KERNEL_STEM=$(basename "$KSRC")
     OUTPUT_ZIP="${DEVICE_CODENAME}-${KERNEL_STEM}-${DATE_TAG}.zip"
+else
+    KERNEL_STEM=$(basename "$KSRC")
 fi
 
 # ============================================
@@ -181,6 +267,43 @@ cp -r "$AK3_TEMPLATE"/* "$BUILD_DIR/"
 cp -r "$AK3_TEMPLATE"/.github "$BUILD_DIR/" 2>/dev/null || true
 
 # ============================================
+# EXTENDED VALIDATIONS (only when NOT --only-necessary)
+# ============================================
+if [ "$ONLY_NECESSARY" -eq 0 ]; then
+    # Validate kernel config flags match expectations
+    if [ -n "$CONFIG_FLAGS" ] && [ "$CONFIG_FLAGS" != "{}" ]; then
+        # Check IKCONFIG_PROC consistency (config_flags uses CONFIG_ prefix)
+        IKCONFIG_JSON=$(printf '%s' "$CONFIG_FLAGS" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('CONFIG_IKCONFIG_PROC',''))" 2>/dev/null || echo "")
+        if [ "$IKCONFIG_JSON" = "y" ] && [ "$IKCONFIG_PROC" -eq 0 ]; then
+            printf '[WARN] Kernel JSON: CONFIG_IKCONFIG_PROC=y in config but ikconfig_proc=0\n' >&2
+        elif [ "$IKCONFIG_JSON" = "n" ] && [ "$IKCONFIG_PROC" -eq 1 ]; then
+            printf '[WARN] Kernel JSON: CONFIG_IKCONFIG_PROC=n in config but ikconfig_proc=1\n' >&2
+        fi
+
+        # Check KPROBES consistency
+        KPROBES_JSON=$(printf '%s' "$CONFIG_FLAGS" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('CONFIG_KPROBES',''))" 2>/dev/null || echo "")
+        if [ "$KPROBES_JSON" = "y" ] && [ "$KPROBES" -eq 0 ]; then
+            printf '[WARN] Kernel JSON: CONFIG_KPROBES=y in config but kprobes=0\n' >&2
+        fi
+
+        # Check PREEMPT consistency
+        PREEMPT_JSON=$(printf '%s' "$CONFIG_FLAGS" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('CONFIG_PREEMPT',''))" 2>/dev/null || echo "")
+        if [ "$PREEMPT_JSON" = "y" ] && [ "$PREEMPT" -eq 0 ]; then
+            printf '[WARN] Kernel JSON: CONFIG_PREEMPT=y in config but preempt=0\n' >&2
+        fi
+    fi
+
+    # If vendor_boot_header version >= 3, suggest flash_vendor_boot
+    if [ -n "$VENDOR_BOOT_HEADER_VERSION" ] && [ "$VENDOR_BOOT_HEADER_VERSION" != "" ]; then
+        if [ "$VENDOR_BOOT_HEADER_VERSION" -ge 3 ] 2>/dev/null; then
+            if [ "$HAS_VENDOR_KERNEL_BOOT" -eq 0 ]; then
+                printf '[INFO] vendor_boot header v%d detected — consider flash_vendor_boot\n' "$VENDOR_BOOT_HEADER_VERSION" >&2
+            fi
+        fi
+    fi
+fi
+
+# ============================================
 # COPY KERNEL ARTIFACTS TO ZIP ROOT
 # ============================================
 printf '[INFO] Copying kernel image: %s\n' "$ZIP_KERNEL_FILE"
@@ -194,6 +317,12 @@ cp "$KERNEL_IMAGE_SRC" "$BUILD_DIR/$ZIP_KERNEL_FILE"
 # GENERATE anykernel.sh FROM TEMPLATE + JSON DATA
 # ============================================
 ANYKERNEL_SH="$BUILD_DIR/anykernel.sh"
+
+# Build device names list (include vendor_product_device if available and not --only-necessary)
+DEVICE_NAMES="${DEVICE_CODENAME}"
+if [ "$ONLY_NECESSARY" -eq 0 ] && [ -n "$VENDOR_PRODUCT_DEVICE" ] && [ "$VENDOR_PRODUCT_DEVICE" != "N/A" ] && [ "$VENDOR_PRODUCT_DEVICE" != "$DEVICE_CODENAME" ]; then
+    DEVICE_NAMES="${DEVICE_CODENAME} ${VENDOR_PRODUCT_DEVICE}"
+fi
 
 cat > "$ANYKERNEL_SH" <<EOF
 # AnyKernel3 configuration for ${DEVICE_CODENAME} (${MODEL})
@@ -214,11 +343,23 @@ do.cleanup=1
 do.cleanuponabort=0
 
 # Device identifiers (AK3 checks these via do.devicecheck)
-device.name1=${DEVICE_CODENAME}
-device.name2=${DEVICE_CODENAME}
-device.name3=${DEVICE_CODENAME}
-device.name4=${DEVICE_CODENAME}
-device.name5=${DEVICE_CODENAME}
+EOF
+
+# Write device.name1-5 from available names
+idx=1
+for name in $DEVICE_NAMES; do
+    if [ $idx -le 5 ]; then
+        printf 'device.name%d=%s\n' "$idx" "$name" >> "$ANYKERNEL_SH"
+        idx=$((idx + 1))
+    fi
+done
+# Fill remaining with primary codename
+while [ $idx -le 5 ]; do
+    printf 'device.name%d=%s\n' "$idx" "$DEVICE_CODENAME" >> "$ANYKERNEL_SH"
+    idx=$((idx + 1))
+done
+
+cat >> "$ANYKERNEL_SH" <<EOF
 
 # Android version & patchlevel support
 supported.versions=${ANDROID_VER}
@@ -228,6 +369,15 @@ supported.vendorpatchlevels=${VSP_YM}
 # Block/partition settings
 block=${BLOCK}
 is_slot_device=${IS_SLOT_DEVICE}
+
+EOF
+
+# Add header_version if available (AK3 needs this for write_boot)
+if [ "$ONLY_NECESSARY" -eq 0 ] && [ -n "$BOOT_HEADER_VERSION" ] && [ "$BOOT_HEADER_VERSION" != "" ]; then
+    printf 'header_version=%s\n' "$BOOT_HEADER_VERSION" >> "$ANYKERNEL_SH"
+fi
+
+cat >> "$ANYKERNEL_SH" <<EOF
 
 # Ramdisk compression (auto-detected by ak3-core if "auto")
 ramdisk_compression=${AK3_RAMDISK_COMPRESSION}
