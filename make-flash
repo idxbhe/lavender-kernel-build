@@ -1,0 +1,345 @@
+#!/bin/sh
+# make-flash — Build AnyKernel3 flashable.zip from device + kernel JSON
+#
+# Usage:
+#   sh make-flash <device-json> <kernel-json> [output-zip-name]
+#
+#   device-json:  output from ./getinfo/get.sh (e.g., lavender.json)
+#   kernel-json:  output from ./get-kernel-info.sh (e.g., san-kernel-4.19.json)
+#   output-zip:   optional, default: <device>-<kernel>-<date>.zip
+#
+# This script is POSIX-compliant (sh/dash/bash/mksh/busybox sh).
+# It reads both JSON files, merges relevant fields, generates anykernel.sh,
+# copies kernel artifacts, and builds the flashable zip using the AnyKernel3
+# template structure.
+
+set +e
+
+# ============================================
+# ARGUMENTS & VALIDATION
+# ============================================
+SCRIPT_PATH="$0"
+SCRIPT_DIR=$(CDPATH= cd "$(dirname "$SCRIPT_PATH")" && pwd)
+
+if [ $# -lt 2 ]; then
+    printf 'Usage: %s <device-json> <kernel-json> [output-zip]\n' "$(basename "$0")" >&2
+    printf '  device-json:  from ./getinfo/get.sh (e.g., lavender.json)\n' >&2
+    printf '  kernel-json:  from ./get-kernel-info.sh (e.g., san-kernel-4.19.json)\n' >&2
+    printf '  output-zip:   optional, default: <device>-<kernel>-YYYYMMDD.zip\n' >&2
+    exit 1
+fi
+
+DEVICE_JSON="$1"
+KERNEL_JSON="$2"
+OUTPUT_ZIP="${3:-}"
+
+# Validate input files exist and are readable
+[ -f "$DEVICE_JSON" ] && [ -r "$DEVICE_JSON" ] || { printf 'ERROR: device JSON not found/readable: %s\n' "$DEVICE_JSON" >&2; exit 1; }
+[ -f "$KERNEL_JSON" ] && [ -r "$KERNEL_JSON" ] || { printf 'ERROR: kernel JSON not found/readable: %s\n' "$KERNEL_JSON" >&2; exit 1; }
+
+# Validate JSON syntax
+python3 -m json.tool "$DEVICE_JSON" >/dev/null 2>&1 || { printf 'ERROR: device JSON invalid\n' >&2; exit 1; }
+python3 -m json.tool "$KERNEL_JSON" >/dev/null 2>&1 || { printf 'ERROR: kernel JSON invalid\n' >&2; exit 1; }
+
+# ============================================
+# JSON EXTRACTION HELPERS (using python for reliability)
+# ============================================
+jget() {
+    # jget <json-file> <key> [default]
+    python3 -c "
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        d = json.load(f)
+    v = d.get(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else '')
+    print(v)
+except Exception as e:
+    print(sys.argv[3] if len(sys.argv) > 3 else '')
+" "$1" "$2" "$3"
+}
+
+jget_bool() {
+    # jget_bool <json-file> <key> -> prints 1 or 0
+    python3 -c "
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        d = json.load(f)
+    v = d.get(sys.argv[2], '')
+    if str(v).lower() in ('1', 'true', 'yes', 'y'): print(1)
+    else: print(0)
+except:
+    print(0)
+" "$1" "$2"
+}
+
+# ============================================
+# EXTRACT DEVICE INFO
+# ============================================
+DEVICE_CODENAME=$(jget "$DEVICE_JSON" "device_codename" "unknown")
+MODEL=$(jget "$DEVICE_JSON" "model" "Unknown Device")
+ANDROID_VER=$(jget "$DEVICE_JSON" "android_version" "11")
+ANDROID_SDK=$(jget "$DEVICE_JSON" "android_sdk" "30")
+SECURITY_PATCH=$(jget "$DEVICE_JSON" "security_patch" "")
+VENDOR_SECURITY_PATCH=$(jget "$DEVICE_JSON" "vendor_security_patch" "")
+BLOCK=$(jget "$DEVICE_JSON" "ak3_recommended_block" "boot")
+IS_SLOT_DEVICE=$(jget "$DEVICE_JSON" "is_ab_device" "0")
+RAMDISK_LOCATION=$(jget "$DEVICE_JSON" "ramdisk_location" "unknown")
+AK3_INSTALL_MODE=$(jget "$DEVICE_JSON" "ak3_install_mode" "split_boot,flash_boot")
+AK3_RAMDISK_COMPRESSION=$(jget "$DEVICE_JSON" "ak3_ramdisk_compression" "none")
+HAS_INIT_BOOT=$(jget_bool "$DEVICE_JSON" "has_init_boot")
+INIT_BOOT_PATH=$(jget "$DEVICE_JSON" "init_boot_path" "")
+HAS_VENDOR_KERNEL_BOOT=$(jget_bool "$DEVICE_JSON" "has_vendor_kernel_boot")
+VENDOR_KERNEL_BOOT_PATH=$(jget "$DEVICE_JSON" "vendor_kernel_boot_path" "")
+VENDOR_BOOT_RAMDISK_COMP=$(jget "$DEVICE_JSON" "vendor_boot_ramdisk_compression" "unknown")
+DTBO_IDX=$(jget "$DEVICE_JSON" "dtbo_idx" "")
+DTB_IDX=$(jget "$DEVICE_JSON" "dtb_idx" "")
+DTBO_PARTITION=$(jget "$DEVICE_JSON" "dtbo_partition" "")
+
+# Format patchlevels for AK3 (YYYY-MM)
+SP_YM=$(printf '%s' "$SECURITY_PATCH" | cut -c1-7)
+VSP_YM=$(printf '%s' "$VENDOR_SECURITY_PATCH" | cut -c1-7)
+
+# ============================================
+# EXTRACT KERNEL INFO
+# ============================================
+KERNEL_RELEASE=$(jget "$KERNEL_JSON" "kernel_release" "UnknownKernel")
+KERNEL_CODENAME=$(jget "$KERNEL_JSON" "kernel_codename" "")
+COMPILER=$(jget "$KERNEL_JSON" "compiler" "")
+LINKER=$(jget "$KERNEL_JSON" "linker" "")
+BUILD_NUMBER=$(jget "$KERNEL_JSON" "build_number" "")
+BUILD_DATE=$(jget "$KERNEL_JSON" "build_date" "")
+KARCH=$(jget "$KERNEL_JSON" "arch" "arm64")
+CROSS_COMPILE=$(jget "$KERNEL_JSON" "cross_compile" "")
+KSU=$(jget_bool "$KERNEL_JSON" "ksu")
+KPROBES=$(jget_bool "$KERNEL_JSON" "kprobes")
+IKCONFIG_PROC=$(jget_bool "$KERNEL_JSON" "ikconfig_proc")
+MODULES_BUILT=$(jget_bool "$KERNEL_JSON" "modules_built")
+PREEMPT=$(jget_bool "$KERNEL_JSON" "preempt")
+KALLSYMS=$(jget_bool "$KERNEL_JSON" "kallsyms")
+HZ=$(jget "$KERNEL_JSON" "hz" "250")
+BEST_DEFCONFIG=$(jget "$KERNEL_JSON" "best_guess_defconfig" "")
+GIT_COMMIT=$(jget "$KERNEL_JSON" "git_commit" "")
+SOURCE_CLEAN=$(jget_bool "$KERNEL_JSON" "source_clean")
+SOURCE_PATH=$(jget "$KERNEL_JSON" "source_path" "")
+OUT_PATH=$(jget "$KERNEL_JSON" "out_path" "")
+
+# Kernel file to package (AK3 recommendation)
+ZIP_KERNEL_FILE=$(jget "$KERNEL_JSON" "zip_kernel_file" "")
+ZIP_KERNEL_HAS_DTB=$(jget_bool "$KERNEL_JSON" "zip_kernel_has_dtb")
+ZIP_DO_MODULES=$(jget_bool "$KERNEL_JSON" "zip_do_modules")
+
+# Appended DTB info
+APPENDED_DTBS=$(jget "$KERNEL_JSON" "appended_dtb_files" "[]")
+DTB_FILES=$(jget "$KERNEL_JSON" "dtb_files" "[]")
+DTBO_FILES=$(jget "$KERNEL_JSON" "dtbo_files" "[]")
+
+# Source kernel directory (for copying artifacts)
+KSRC=$(jget "$KERNEL_JSON" "source_path" "")
+# Try to find the actual kernel image in the source out/ dir
+KOUT=$(jget "$KERNEL_JSON" "out_path" "")
+
+# ============================================
+# VALIDATE CRITICAL PATHS
+# ============================================
+if [ -z "$ZIP_KERNEL_FILE" ] || [ "$ZIP_KERNEL_FILE" = "null" ]; then
+    printf 'ERROR: No kernel file recommended in kernel JSON\n' >&2
+    exit 1
+fi
+
+KERNEL_IMAGE_SRC="$OUT_PATH/arch/$KARCH/boot/$ZIP_KERNEL_FILE"
+if [ ! -f "$KERNEL_IMAGE_SRC" ]; then
+    # Fallback: try source path
+    KERNEL_IMAGE_SRC="$KSRC/out/arch/$KARCH/boot/$ZIP_KERNEL_FILE"
+fi
+if [ ! -f "$KERNEL_IMAGE_SRC" ]; then
+    printf 'ERROR: Kernel image not found at %s\n' "$KERNEL_IMAGE_SRC" >&2
+    exit 1
+fi
+
+# Determine output zip name if not provided
+if [ -z "$OUTPUT_ZIP" ]; then
+    DATE_TAG=$(date +%Y%m%d 2>/dev/null || echo "nodate")
+    KERNEL_STEM=$(basename "$KSRC")
+    OUTPUT_ZIP="${DEVICE_CODENAME}-${KERNEL_STEM}-${DATE_TAG}.zip"
+fi
+
+# ============================================
+# BUILD TEMP DIRECTORY STRUCTURE
+# ============================================
+BUILD_DIR=$(mktemp -d /tmp/make-flash.XXXXXX)
+trap 'rm -rf "$BUILD_DIR"' EXIT INT TERM
+
+# Copy AnyKernel3 template
+AK3_TEMPLATE="$SCRIPT_DIR/AnyKernel3"
+if [ ! -d "$AK3_TEMPLATE" ]; then
+    printf 'ERROR: AnyKernel3 template not found at %s\n' "$AK3_TEMPLATE" >&2
+    exit 1
+fi
+
+cp -r "$AK3_TEMPLATE"/* "$BUILD_DIR/"
+cp -r "$AK3_TEMPLATE"/.github "$BUILD_DIR/" 2>/dev/null || true
+
+# ============================================
+# COPY KERNEL ARTIFACTS TO ZIP ROOT
+# ============================================
+printf '[INFO] Copying kernel image: %s\n' "$ZIP_KERNEL_FILE"
+cp "$KERNEL_IMAGE_SRC" "$BUILD_DIR/$ZIP_KERNEL_FILE"
+
+# If kernel has NO appended DTB, we may need standalone DTB/DTBO
+# For now, we rely on appended DTB (zip_kernel_has_dtb=1)
+# If user wants separate dtbo, they can add it manually or we can enhance later.
+
+# ============================================
+# GENERATE anykernel.sh FROM TEMPLATE + JSON DATA
+# ============================================
+ANYKERNEL_SH="$BUILD_DIR/anykernel.sh"
+
+cat > "$ANYKERNEL_SH" <<EOF
+# AnyKernel3 configuration for ${DEVICE_CODENAME} (${MODEL})
+# Generated by make-flash on $(date 2>/dev/null)
+# Device JSON: $(basename "$DEVICE_JSON")
+# Kernel JSON: $(basename "$KERNEL_JSON")
+# Kernel: ${KERNEL_RELEASE}
+# Source: ${KERNEL_STEM} @ ${GIT_COMMIT}
+
+# Kernel string shown in recovery
+kernel.string=${KERNEL_RELEASE}
+
+# Kernel features
+do.devicecheck=1
+do.modules=${ZIP_DO_MODULES}
+do.systemless=1
+do.cleanup=1
+do.cleanuponabort=0
+
+# Device identifiers (AK3 checks these via do.devicecheck)
+device.name1=${DEVICE_CODENAME}
+device.name2=${DEVICE_CODENAME}
+device.name3=${DEVICE_CODENAME}
+device.name4=${DEVICE_CODENAME}
+device.name5=${DEVICE_CODENAME}
+
+# Android version & patchlevel support
+supported.versions=${ANDROID_VER}
+supported.patchlevels=${SP_YM}
+supported.vendorpatchlevels=${VSP_YM}
+
+# Block/partition settings
+block=${BLOCK}
+is_slot_device=${IS_SLOT_DEVICE}
+
+# Ramdisk compression (auto-detected by ak3-core if "auto")
+ramdisk_compression=${AK3_RAMDISK_COMPRESSION}
+
+# Import ak3-core functions
+. tools/ak3-core.sh
+
+EOF
+
+# Add install method based on device ramdisk_location and install_mode
+case "$AK3_INSTALL_MODE" in
+    *dump_boot*|*write_boot*)
+        # Ramdisk repack mode (legacy/non-SAR)
+        cat >> "$ANYKERNEL_SH" <<EOF
+# Ramdisk repack mode (device has ramdisk in boot)
+dump_boot
+write_boot
+EOF
+        ;;
+    *split_boot*|*flash_boot*)
+        # Kernel-only flash mode (SAR, GKI, or appended-DTB)
+        cat >> "$ANYKERNEL_SH" <<EOF
+# Kernel-only flash mode (SAR / appended-DTB / GKI)
+# Kernel file at zip root: ${ZIP_KERNEL_FILE}
+split_boot
+flash_boot
+EOF
+        # If there's a dtbo partition and we have dtbo files, optionally flash_dtbo
+        if [ -n "$DTBO_PARTITION" ] && [ "$DTBO_PARTITION" != "{}" ]; then
+            DTBO_PATH=$(printf '%s' "$DTBO_PARTITION" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('path',''))" 2>/dev/null)
+            if [ -n "$DTBO_PATH" ] && [ "$DTBO_PATH" != "null" ]; then
+                cat >> "$ANYKERNEL_SH" <<EOF
+# Optional: flash dtbo partition if needed
+# flash_dtbo
+EOF
+            fi
+        fi
+        # If vendor_kernel_boot exists (hdr v4 dtb-only), flash it too
+        if [ "$HAS_VENDOR_KERNEL_BOOT" -eq 1 ] && [ -n "$VENDOR_KERNEL_BOOT_PATH" ]; then
+            cat >> "$ANYKERNEL_SH" <<EOF
+# Vendor kernel boot partition (hdr v4 dtb-only)
+# flash_vendor_kernel_boot
+EOF
+        fi
+        ;;
+    *)
+        # Default to split_boot + flash_boot (safest for modern devices)
+        cat >> "$ANYKERNEL_SH" <<EOF
+# Default kernel-only flash
+split_boot
+flash_boot
+EOF
+        ;;
+esac
+
+# ============================================
+# COPY MODULES IF do.modules=1 AND modules/ dir EXISTS IN SOURCE
+# ============================================
+if [ "$ZIP_DO_MODULES" -eq 1 ]; then
+    # Look for built modules in out/
+    MODULE_DIRS=$(find "$OUT_PATH" -type f -name '*.ko' 2>/dev/null | head -1 | xargs -r dirname)
+    if [ -n "$MODULE_DIRS" ]; then
+        printf '[INFO] Copying modules from %s\n' "$MODULE_DIRS"
+        mkdir -p "$BUILD_DIR/modules"
+        find "$OUT_PATH" -type f -name '*.ko' -exec cp {} "$BUILD_DIR/modules/" \; 2>/dev/null
+    fi
+fi
+
+# ============================================
+# PACKAGE THE ZIP
+# ============================================
+printf '[INFO] Building flashable zip: %s\n' "$OUTPUT_ZIP"
+cd "$BUILD_DIR"
+
+# Use zip if available, else Python zipfile
+if command -v zip >/dev/null 2>&1; then
+    zip -r9 "$OUTPUT_ZIP" . \
+        -x "*.git*" \
+        -x "*.github/*" \
+        -x "*/\.*" \
+        -x "README.md" \
+        -x "LICENSE" \
+        -x "make-flash*" \
+        2>/dev/null
+else
+    python3 -c "
+import zipfile, os, sys
+with zipfile.ZipFile(sys.argv[1], 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+    for root, dirs, files in os.walk('.'):
+        # Skip excluded dirs
+        dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ('github', '.git')]
+        for f in files:
+            if f.startswith('.') or f in ('README.md', 'LICENSE') or f.startswith('make-flash'):
+                continue
+            filepath = os.path.join(root, f)
+            arcname = os.path.relpath(filepath, '.')
+            zf.write(filepath, arcname)
+" "$OUTPUT_ZIP"
+fi
+
+# Move zip to original directory
+mv "$OUTPUT_ZIP" "$SCRIPT_DIR/$OUTPUT_ZIP"
+
+printf '[SUCCESS] Flashable zip created: %s\n' "$SCRIPT_DIR/$OUTPUT_ZIP"
+printf '          Kernel: %s\n' "$KERNEL_RELEASE"
+printf '          Device: %s (%s)\n' "$DEVICE_CODENAME" "$MODEL"
+printf '          Install mode: %s\n' "$AK3_INSTALL_MODE"
+printf '          Kernel file: %s (appended DTB=%s)\n' "$ZIP_KERNEL_FILE" "$ZIP_KERNEL_HAS_DTB"
+
+# Cleanup
+rm -rf "$BUILD_DIR"
+trap - EXIT INT TERM
+
+exit 0
+EOF

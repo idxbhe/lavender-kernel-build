@@ -572,6 +572,37 @@ json_add_str "build_branch"  "$BRANCH"
 json_add_str "llvm_enabled" "$LLVM_USED"
 
 # ============================================
+# 10b. SOURCE TREE STATUS (read-only git inspection)
+# ============================================
+log_header "10b. SOURCE TREE STATUS"
+
+GIT_COMMIT=""
+GIT_DIRTY=0
+if [ -d "$KSRC/.git" ]; then
+    GIT_COMMIT=$(cd "$KSRC" && git rev-parse --short HEAD 2>/dev/null)
+    if ! cd "$KSRC" && git diff --quiet 2>/dev/null && git diff --cached --quiet 2>/dev/null; then
+        GIT_DIRTY=0
+    else
+        GIT_DIRTY=1
+    fi
+    log_info "Git commit: ${GIT_COMMIT:-unknown}"
+    log_info "Git dirty : $GIT_DIRTY (0=clean, 1=has uncommitted changes)"
+else
+    log_info "Not a git repo (or .git missing)"
+fi
+
+# Verify KOUT is inside KSRC/out (read-only sanity check)
+OUT_INSIDE_SOURCE=0
+case "$KOUT" in
+    "$KSRC/out"*) OUT_INSIDE_SOURCE=1 ;;
+esac
+log_info "Out dir inside source: $OUT_INSIDE_SOURCE"
+
+json_add_str "git_commit"         "$GIT_COMMIT"
+json_add_str "source_clean"       "$((1 - GIT_DIRTY))"
+json_add_str "out_inside_source"  "$OUT_INSIDE_SOURCE"
+
+# ============================================
 # 11. AK3 ZIP-PACKAGING CHEATSHEET (derived)
 # ============================================
 log_header "11. AK3 ZIP-PACKAGING SUMMARY"
