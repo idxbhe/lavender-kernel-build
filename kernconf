@@ -1,0 +1,586 @@
+#!/usr/bin/env python3
+"""
+kernconf - Kernel config comparison and synchronization tool
+
+Usage:
+    kernconf check <source_config> <device_config> [--filter critical|important]
+    kernconf sync <source_config> <device_config> [-o|--output <output_path>] [--filter critical|important]
+
+Examples:
+    kernconf check ./san-kernel-4.19/arch/arm64/configs/vendor/lavender-perf_defconfig lavender.devconfig
+    kernconf check ./san-kernel-4.19/arch/arm64/configs/vendor/lavender-perf_defconfig lavender.devconfig --filter critical
+    kernconf sync ./san-kernel-4.19/arch/arm64/configs/vendor/lavender-perf_defconfig lavender.devconfig -o lavender_synced_defconfig --filter important
+"""
+
+import sys
+import os
+import argparse
+from pathlib import Path
+from typing import Dict, Set, Tuple, List, Optional
+
+
+# =============================================================================
+# CRITICAL & IMPORTANT CONFIG LISTS
+# These are configs known to cause bootloops or major issues when mismatched
+# =============================================================================
+
+CRITICAL_CONFIGS = {
+    # Timer / Scheduler - WRONG HZ = instant bootloop/hang
+    'CONFIG_HZ': 'Timer frequency (100/250/300/1000) - MUST match device',
+    'CONFIG_HZ_100': 'Timer 100Hz',
+    'CONFIG_HZ_250': 'Timer 250Hz',
+    'CONFIG_HZ_300': 'Timer 300Hz',
+    'CONFIG_HZ_1000': 'Timer 1000Hz',
+
+    # Module support - NO MODULES = wifi/bt/sensors/camera won't work
+    'CONFIG_MODULES': 'Loadable module support',
+    'CONFIG_MODVERSIONS': 'Module versioning (CRC)',
+    'CONFIG_MODULE_UNLOAD': 'Module unloading',
+    'CONFIG_MODULE_FORCE_UNLOAD': 'Force module unload',
+    'CONFIG_MODULES_TREE_LOOKUP': 'Module tree lookup',
+    'CONFIG_MODULES_USE_ELF_RELA': 'Module ELF RELA',
+
+    # KernelSU / Root - mismatch = bootloop or broken root
+    'CONFIG_KSU': 'KernelSU support',
+    'CONFIG_KSU_DAEMON': 'KernelSU daemon',
+    'CONFIG_KSU_DEBUG': 'KernelSU debug',
+    'CONFIG_KSU_DISABLE_MANAGER': 'KernelSU disable manager',
+    'CONFIG_KSU_MANUAL_HOOK': 'KernelSU manual hook',
+
+    # Security hardening - mismatch can cause boot failure
+    'CONFIG_INIT_ON_ALLOC_DEFAULT_ON': 'Init on alloc (hardening)',
+    'CONFIG_INIT_ON_FREE_DEFAULT_ON': 'Init on free (hardening)',
+    'CONFIG_RANDOMIZE_BASE': 'KASLR',
+    'CONFIG_DEBUG_RODATA': 'Read-only data',
+    'CONFIG_DEBUG_SET_MODULE_RONX': 'Module RO/NX',
+
+    # Preemption model - mismatch = scheduler issues
+    'CONFIG_PREEMPT': 'Preemptible kernel',
+    'CONFIG_PREEMPT_NONE': 'No preemption',
+    'CONFIG_PREEMPT_VOLUNTARY': 'Voluntary preemption',
+    'CONFIG_PREEMPT_RCU': 'Preempt RCU',
+
+    # CPU idle / freq - mismatch = battery drain, thermal issues
+    'CONFIG_CPU_IDLE': 'CPU idle',
+    'CONFIG_CPU_FREQ': 'CPU frequency scaling',
+    'CONFIG_CPUFREQ_GOV_PERFORMANCE': 'Performance governor',
+    'CONFIG_CPUFREQ_GOV_POWERSAVE': 'Powersave governor',
+    'CONFIG_CPUFREQ_GOV_USERSPACE': 'Userspace governor',
+    'CONFIG_CPUFREQ_GOV_ONDEMAND': 'Ondemand governor',
+    'CONFIG_CPUFREQ_GOV_CONSERVATIVE': 'Conservative governor',
+    'CONFIG_CPUFREQ_GOV_SCHEDUTIL': 'Schedutil governor',
+
+    # ARM64 errata / hardware - device-specific
+    'CONFIG_ARM64_ERRATUM_824069': 'Cortex-A53 erratum',
+    'CONFIG_ARM64_ERRATUM_826319': 'Cortex-A53 erratum',
+    'CONFIG_ARM64_ERRATUM_827319': 'Cortex-A53 erratum',
+    'CONFIG_ARM64_ERRATUM_832075': 'Cortex-A53 erratum',
+    'CONFIG_ARM64_ERRATUM_843419': 'Cortex-A53 erratum',
+    'CONFIG_ARM64_ERRATUM_1024718': 'Cortex-A53 erratum',
+    'CONFIG_ARM64_ERRATUM_1188873': 'Cortex-A53 erratum',
+    'CONFIG_ARM64_ERRATUM_1463225': 'Cortex-A53 erratum',
+    'CONFIG_ARM64_ERRATUM_1542418': 'Cortex-A53 erratum',
+    'CONFIG_ARM64_ERRATUM_1542419': 'Cortex-A53 erratum',
+    'CONFIG_ARM64_PAN': 'Privileged Access Never',
+    'CONFIG_ARM64_UAO': 'User Access Override',
+    'CONFIG_ARM64_SW_TTBR0_PAN': 'SW TTBR0 PAN',
+
+    # Android binder - MUST match
+    'CONFIG_ANDROID_BINDER_IPC': 'Binder IPC',
+    'CONFIG_ANDROID_BINDERFS': 'BinderFS',
+    'CONFIG_ANDROID': 'Android support',
+
+    # IKCONFIG - needed for /proc/config.gz
+    'CONFIG_IKCONFIG': 'IKCONFIG',
+    'CONFIG_IKCONFIG_PROC': 'IKCONFIG /proc',
+
+    # Appended DTB - critical for boot
+    'CONFIG_BUILD_ARM64_APPENDED_DTB_IMAGE': 'Appended DTB',
+    'CONFIG_BUILD_ARM64_DT_OVERLAY': 'DT overlay',
+
+    # Kprobes / tracing - debugging
+    'CONFIG_KPROBES': 'Kprobes',
+    'CONFIG_KALLSYMS': 'Kallsyms',
+    'CONFIG_KALLSYMS_BASE_RELATIVE': 'Kallsyms relative',
+
+    # Local version - affects module loading
+    'CONFIG_LOCALVERSION': 'Local version string',
+    'CONFIG_LOCALVERSION_AUTO': 'Auto local version',
+
+    # Core dump / crash - debugging
+    'CONFIG_COREDUMP': 'Core dump',
+    'CONFIG_ALLOW_DEV_COREDUMP': 'Dev coredump',
+}
+
+IMPORTANT_CONFIGS = {
+    # Memory management
+    'CONFIG_SLAB': 'SLAB allocator',
+    'CONFIG_SLUB': 'SLUB allocator',
+    'CONFIG_SLOB': 'SLOB allocator',
+    'CONFIG_SLAB_MERGE_DEFAULT': 'Slab merge',
+    'CONFIG_SLUB_CPU_PARTIAL': 'SLUB CPU partial',
+    'CONFIG_HUGETLBFS': 'HugeTLBFS',
+    'CONFIG_TRANSPARENT_HUGEPAGE': 'Transparent hugepage',
+    'CONFIG_ZSWAP': 'Zswap',
+    'CONFIG_ZRAM': 'Zram',
+
+    # Filesystems
+    'CONFIG_EXT4_FS': 'ext4',
+    'CONFIG_F2FS_FS': 'F2FS',
+    'CONFIG_EROFS_FS': 'EROFS',
+    'CONFIG_EXFAT_FS': 'exFAT',
+    'CONFIG_NTFS3_FS': 'NTFS3',
+    'CONFIG_OVERLAY_FS': 'OverlayFS',
+
+    # Block / IO
+    'CONFIG_BLK_DEV_LOOP': 'Loop device',
+    'CONFIG_BLK_DEV_RAM': 'RAM block device',
+    'CONFIG_BLK_DEV_NVME': 'NVMe',
+    'CONFIG_NVME_CORE': 'NVMe core',
+
+    # Network
+    'CONFIG_INET': 'IPv4',
+    'CONFIG_IPV6': 'IPv6',
+    'CONFIG_NETFILTER': 'Netfilter',
+    'CONFIG_BRIDGE': 'Bridge',
+    'CONFIG_VLAN_8021Q': 'VLAN',
+
+    # Crypto
+    'CONFIG_CRYPTO_AES': 'AES',
+    'CONFIG_CRYPTO_SHA256': 'SHA256',
+    'CONFIG_CRYPTO_CRC32': 'CRC32',
+    'CONFIG_CRYPTO_USER_API': 'Crypto user API',
+
+    # Debug / tracing (important for development)
+    'CONFIG_DEBUG_FS': 'DebugFS',
+    'CONFIG_DEBUG_KERNEL': 'Debug kernel',
+    'CONFIG_DEBUG_INFO': 'Debug info',
+    'CONFIG_DEBUG_INFO_DWARF4': 'DWARF4',
+    'CONFIG_DEBUG_INFO_BTF': 'BTF',
+    'CONFIG_FTRACE': 'Ftrace',
+    'CONFIG_FUNCTION_TRACER': 'Function tracer',
+    'CONFIG_STACK_TRACER': 'Stack tracer',
+
+    # Power management
+    'CONFIG_SUSPEND': 'Suspend',
+    'CONFIG_HIBERNATION': 'Hibernation',
+    'CONFIG_PM': 'Power management',
+    'CONFIG_PM_SLEEP': 'PM sleep',
+    'CONFIG_PM_AUTOSLEEP': 'Auto sleep',
+    'CONFIG_PM_WAKELOCKS': 'Wakelocks',
+
+    # Android specific
+    'CONFIG_ANDROID_PARANOID_NETWORK': 'Paranoid network',
+    'CONFIG_ANDROID_RAM_CONSOLE': 'RAM console',
+    'CONFIG_ANDROID_LOW_MEMORY_KILLER': 'LMK',
+    'CONFIG_ANDROID_LOGGER': 'Logger',
+    'CONFIG_ION': 'ION',
+    'CONFIG_DMA_BUF': 'DMA-BUF',
+    'CONFIG_SYNC_FILE': 'Sync file',
+
+    # GPU / Display
+    'CONFIG_DRM': 'DRM',
+    'CONFIG_DRM_MSM': 'MSM DRM',
+    'CONFIG_DRM_KMS_HELPER': 'KMS helper',
+    'CONFIG_FB': 'Framebuffer',
+
+    # Sensors / IIO
+    'CONFIG_IIO': 'IIO',
+    'CONFIG_SENSORS': 'Sensors',
+
+    # USB
+    'CONFIG_USB': 'USB',
+    'CONFIG_USB_GADGET': 'USB Gadget',
+    'CONFIG_USB_CONFIGFS': 'USB ConfigFS',
+
+    # Sound
+    'CONFIG_SND': 'Sound',
+    'CONFIG_SND_SOC': 'ALSA SoC',
+
+    # Clock / Regulator
+    'CONFIG_COMMON_CLK': 'Common clock',
+    'CONFIG_REGULATOR': 'Regulator',
+
+    # Security
+    'CONFIG_SECURITY': 'Security',
+    'CONFIG_SECURITY_NETWORK': 'Network security',
+    'CONFIG_SECURITY_SELINUX': 'SELinux',
+    'CONFIG_SECURITY_APPARMOR': 'AppArmor',
+
+    # ARM64 features
+    'CONFIG_ARM64_SVE': 'SVE',
+    'CONFIG_ARM64_PAN': 'PAN',
+    'CONFIG_ARM64_UAO': 'UAO',
+    'CONFIG_ARM64_MTE': 'MTE',
+    'CONFIG_ARM64_TAGGED_ADDR_ABI': 'Tagged addr ABI',
+
+    # Virtualization
+    'CONFIG_KVM': 'KVM',
+    'CONFIG_KVM_ARM_HOST': 'KVM ARM host',
+
+    # Tracing
+    'CONFIG_RING_BUFFER': 'Ring buffer',
+    'CONFIG_TRACING': 'Tracing',
+
+    # Lock debugging
+    'CONFIG_LOCK_DEBUGGING_SUPPORT': 'Lock debug',
+    'CONFIG_PROVE_LOCKING': 'Prove locking',
+    'CONFIG_DEBUG_SPINLOCK': 'Debug spinlock',
+    'CONFIG_DEBUG_MUTEXES': 'Debug mutexes',
+}
+
+# Combine all filter configs
+FILTER_CONFIGS = {
+    'critical': CRITICAL_CONFIGS,
+    'important': {**CRITICAL_CONFIGS, **IMPORTANT_CONFIGS},  # important includes critical
+}
+
+
+class KernelConfigParser:
+    """Parse kernel config files (.config, defconfig)"""
+
+    def __init__(self):
+        self.configs: Dict[str, str] = {}
+        self.comments: List[str] = []
+        self._line_map: Dict[str, int] = {}  # config -> line number for ordering
+
+    def parse(self, filepath: str) -> 'KernelConfigParser':
+        """Parse a kernel config file"""
+        self.configs = {}
+        self.comments = []
+        self._line_map = {}
+
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"Config file not found: {filepath}")
+
+        with open(filepath, 'r') as f:
+            lines = f.readlines()
+
+        for i, line in enumerate(lines):
+            line = line.rstrip('\n')
+            stripped = line.strip()
+
+            # Skip empty lines
+            if not stripped:
+                self.comments.append(line)
+                continue
+
+            # Comments
+            if stripped.startswith('#'):
+                self.comments.append(line)
+                # Check for "CONFIG_X is not set"
+                if ' is not set' in stripped:
+                    config_name = stripped[1:].split(' is not set')[0].strip()
+                    self.configs[config_name] = 'n'
+                    self._line_map[config_name] = i
+                continue
+
+            # CONFIG_*=value
+            if '=' in stripped and stripped.startswith('CONFIG_'):
+                key, value = stripped.split('=', 1)
+                self.configs[key] = value
+                self._line_map[key] = i
+                continue
+
+            # Other lines (shouldn't happen in valid config)
+            self.comments.append(line)
+
+        return self
+
+    def get(self, key: str, default: str = None) -> str:
+        return self.configs.get(key, default)
+
+    def keys(self) -> Set[str]:
+        return set(self.configs.keys())
+
+    def items(self) -> Dict[str, str]:
+        return self.configs.copy()
+
+    def write(self, filepath: str, preserve_order: bool = True):
+        """Write config to file"""
+        lines = []
+
+        if preserve_order and self._line_map:
+            # Sort by original line number
+            sorted_configs = sorted(self.configs.items(), key=lambda x: self._line_map.get(x[0], 999999))
+        else:
+            sorted_configs = sorted(self.configs.items())
+
+        for key, value in sorted_configs:
+            if value == 'n':
+                lines.append(f"# {key} is not set")
+            else:
+                lines.append(f"{key}={value}")
+
+        with open(filepath, 'w') as f:
+            f.write('\n'.join(lines) + '\n')
+
+
+def load_config(filepath: str) -> KernelConfigParser:
+    """Load and parse a kernel config file"""
+    parser = KernelConfigParser()
+    parser.parse(filepath)
+    return parser
+
+
+def get_filter_configs(filter_name: str) -> Dict[str, str]:
+    """Get the filter config list"""
+    if filter_name not in FILTER_CONFIGS:
+        raise ValueError(f"Unknown filter: {filter_name}. Available: {list(FILTER_CONFIGS.keys())}")
+    return FILTER_CONFIGS[filter_name]
+
+
+def compare_configs(source: KernelConfigParser, device: KernelConfigParser, filter_name: Optional[str] = None) -> Tuple[List[Tuple[str, str, str]], List[str], List[str]]:
+    """
+    Compare source config (base) with device config.
+
+    If filter_name is provided, only compare configs in the filter list.
+    Otherwise, compare all configs that exist in SOURCE.
+    """
+    source_keys = source.keys()
+    device_keys = device.keys()
+
+    if filter_name:
+        # Filter mode: basis is the filter list, not source
+        filter_keys = set(get_filter_configs(filter_name).keys())
+        # Only compare configs that exist in BOTH filter and device
+        common_keys = filter_keys & device_keys
+    else:
+        # Normal mode: basis is source
+        common_keys = source_keys & device_keys
+
+    differences = []
+    for key in sorted(common_keys):
+        src_val = source.get(key)
+        dev_val = device.get(key)
+        if src_val != dev_val:
+            differences.append((key, src_val, dev_val))
+
+    if filter_name:
+        filter_keys = set(get_filter_configs(filter_name).keys())
+        only_in_filter = sorted(filter_keys - device_keys)
+        only_in_device = sorted(device_keys & filter_keys)  # device keys that are in filter
+        only_in_source = []  # not applicable in filter mode
+    else:
+        only_in_source = sorted(source_keys - device_keys)
+        only_in_device = sorted(device_keys - source_keys)
+        only_in_filter = []
+
+    return differences, only_in_source, only_in_device, only_in_filter
+
+
+def sync_configs(source: KernelConfigParser, device: KernelConfigParser, filter_name: Optional[str] = None) -> KernelConfigParser:
+    """
+    Create synced config: source base with device values for common keys.
+    If filter_name provided, also add filter configs that don't exist in source.
+    """
+    source_keys = source.keys()
+    device_keys = device.keys()
+
+    synced = KernelConfigParser()
+    synced.configs = source.configs.copy()
+    synced._line_map = source._line_map.copy()
+    synced.comments = source.comments.copy()
+
+    if filter_name:
+        # Filter mode: basis is filter list
+        filter_configs = get_filter_configs(filter_name)
+        filter_keys = set(filter_configs.keys())
+
+        # For each filter config, use device value if exists, else keep source, else add from filter
+        for key in filter_keys:
+            if key in device_keys:
+                synced.configs[key] = device.get(key)
+                if key not in synced._line_map:
+                    synced._line_map[key] = 999999  # append at end
+            elif key in source_keys:
+                # Keep source value
+                pass
+            else:
+                # Not in source or device - we don't add unknowns
+                pass
+    else:
+        # Normal mode: update with device values for keys that exist in BOTH
+        common_keys = source_keys & device_keys
+        for key in common_keys:
+            synced.configs[key] = device.get(key)
+
+    return synced
+
+
+def cmd_check(args):
+    """Check command: compare configs"""
+    try:
+        source = load_config(args.source_config)
+        device = load_config(args.device_config)
+    except FileNotFoundError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    differences, only_in_source, only_in_device, only_in_filter = compare_configs(source, device, args.filter)
+
+    if args.filter:
+        filter_configs = get_filter_configs(args.filter)
+        print(f"=== Kernel Config Comparison (FILTER: {args.filter.upper()}) ===")
+        print(f"Source: {args.source_config} ({len(source.keys())} configs)")
+        print(f"Device: {args.device_config} ({len(device.keys())} configs)")
+        print(f"Filter configs: {len(filter_configs)} ({args.filter})")
+        print(f"Compared (filter ∩ device): {len(set(filter_configs.keys()) & device.keys())}")
+        print(f"Differences: {len(differences)}")
+        print(f"Filter configs missing in device: {len(only_in_filter)}")
+        print()
+    else:
+        print(f"=== Kernel Config Comparison ===")
+        print(f"Source: {args.source_config} ({len(source.keys())} configs)")
+        print(f"Device: {args.device_config} ({len(device.keys())} configs)")
+        print(f"Common: {len(source.keys() & device.keys())} configs")
+        print(f"Only in source: {len(only_in_source)}")
+        print(f"Only in device (ignored): {len(only_in_device)}")
+        print(f"Differences: {len(differences)}")
+        print()
+
+    if differences:
+        print(f"=== DIFFERENCES ({'filter' if args.filter else 'source'} vs device) ===")
+        print(f"{'CONFIG':<55} {'SOURCE':<15} {'DEVICE':<15}")
+        print("-" * 85)
+        for key, src_val, dev_val in differences:
+            desc = ""
+            if args.filter and key in get_filter_configs(args.filter):
+                desc = f"  # {get_filter_configs(args.filter)[key]}"
+            src_display = src_val if src_val is not None else 'MISSING'
+            print(f"{key:<55} {src_display:<15} {dev_val:<15}{desc}")
+    else:
+        print("✓ No differences in compared configs")
+
+    if args.verbose:
+        if args.filter and only_in_filter:
+            print()
+            print(f"=== FILTER CONFIGS MISSING IN DEVICE ===")
+            for key in only_in_filter:
+                desc = get_filter_configs(args.filter).get(key, '')
+                print(f"{key}=MISSING  # {desc}")
+
+        if not args.filter and only_in_source:
+            print()
+            print("=== ONLY IN SOURCE (not in device) ===")
+            for key in only_in_source:
+                val = source.get(key)
+                print(f"{key}={val}")
+
+        if not args.filter and only_in_device:
+            print()
+            print("=== ONLY IN DEVICE (ignored per spec) ===")
+            for key in only_in_device:
+                val = device.get(key)
+                print(f"{key}={val}")
+
+    # Exit code: 0 = no differences, 1 = differences found
+    sys.exit(0 if len(differences) == 0 else 1)
+
+
+def cmd_sync(args):
+    """Sync command: create synced config"""
+    try:
+        source = load_config(args.source_config)
+        device = load_config(args.device_config)
+    except FileNotFoundError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    differences, only_in_source, only_in_device, only_in_filter = compare_configs(source, device, args.filter)
+
+    # Create synced config
+    synced = sync_configs(source, device, args.filter)
+
+    # Determine output path
+    if args.output:
+        output_path = args.output
+    else:
+        # Default: source config name with _synced suffix
+        source_path = Path(args.source_config)
+        filter_suffix = f"_{args.filter}" if args.filter else ""
+        output_path = str(source_path.parent / f"{source_path.stem}_synced{filter_suffix}{source_path.suffix}")
+
+    # Write synced config
+    synced.write(output_path)
+
+    if args.filter:
+        filter_configs = get_filter_configs(args.filter)
+        print(f"=== Kernel Config Sync (FILTER: {args.filter.upper()}) ===")
+        print(f"Source: {args.source_config}")
+        print(f"Device: {args.device_config}")
+        print(f"Output: {output_path}")
+        print(f"Filter configs: {len(filter_configs)} ({args.filter})")
+        print(f"Differences resolved: {len(differences)}")
+        print(f"Filter configs missing in device: {len(only_in_filter)}")
+        print()
+    else:
+        print(f"=== Kernel Config Sync ===")
+        print(f"Source: {args.source_config}")
+        print(f"Device: {args.device_config}")
+        print(f"Output: {output_path}")
+        print(f"Common configs synced: {len(source.keys() & device.keys())}")
+        print(f"Differences resolved: {len(differences)}")
+        print(f"Device-only configs ignored: {len(only_in_device)}")
+        print(f"Source-only configs preserved: {len(only_in_source)}")
+        print()
+
+    print(f"✓ Synced config written to: {output_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Kernel config comparison and synchronization tool",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  kernconf check ./kernel/arch/arm64/configs/lavender_defconfig ./lavender.devconfig
+  kernconf check ./kernel/arch/arm64/configs/lavender_defconfig ./lavender.devconfig --filter critical
+  kernconf check ./kernel/arch/arm64/configs/lavender_defconfig ./lavender.devconfig --filter important
+  kernconf sync ./kernel/arch/arm64/configs/lavender_defconfig ./lavender.devconfig -o lavender_synced_defconfig
+  kernconf sync ./kernel/arch/arm64/configs/lavender_defconfig ./lavender.devconfig --filter critical -o lavender_critical_defconfig
+
+Filters:
+  critical  - Bootloop-causing configs (HZ, modules, KSU, preempt, ARM64 errata, etc.)
+  important - Critical + important configs (fs, memory, net, debug, power, android, etc.)
+
+Behavior:
+  - check: Compares device config against source config BASE.
+           Only shows differences for configs that EXIST in source.
+           Configs only in device are IGNORED (not shown by default).
+    With --filter: Basis changes to filter list. Shows differences for filter configs.
+                   Filter configs missing in device are reported.
+
+  - sync:  Creates a new config based on source, with device values
+           for common keys. Device-only configs are IGNORED.
+           Source-only configs are PRESERVED.
+    With --filter: Also ensures all filter configs are present in output.
+                   Missing filter configs are added with device values.
+"""
+    )
+    subparsers = parser.add_subparsers(dest='command', required=True)
+
+    # check command
+    check_parser = subparsers.add_parser('check', help='Compare source config vs device config')
+    check_parser.add_argument('source_config', help='Source kernel config (base)')
+    check_parser.add_argument('device_config', help='Device config (reference)')
+    check_parser.add_argument('-v', '--verbose', action='store_true', help='Show only-in-source and ignored device configs')
+    check_parser.add_argument('--filter', choices=['critical', 'important'], help='Filter mode: critical (bootloop-causing) or important (critical + important)')
+
+    # sync command
+    sync_parser = subparsers.add_parser('sync', help='Sync source config with device config')
+    sync_parser.add_argument('source_config', help='Source kernel config (base)')
+    sync_parser.add_argument('device_config', help='Device config (reference)')
+    sync_parser.add_argument('-o', '--output', help='Output path (default: <source>_synced<ext>)')
+    sync_parser.add_argument('--filter', choices=['critical', 'important'], help='Filter mode: critical (bootloop-causing) or important (critical + important)')
+
+    args = parser.parse_args()
+
+    if args.command == 'check':
+        cmd_check(args)
+    elif args.command == 'sync':
+        cmd_sync(args)
+
+
+if __name__ == '__main__':
+    main()

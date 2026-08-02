@@ -16,4 +16,4 @@ san_scripts/
 *.log
 *.json
 *.zip
-
+*.devconfig
