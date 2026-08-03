@@ -1,0 +1,615 @@
+#!/usr/bin/env python3
+"""
+drspace-install — Install Droidspaces OSS kernel configurations.
+Usage:
+    ./drspace-install <kernel_source_path> <defconfig_path> [--include-optional]
+
+Arguments:
+    kernel_source_path : path to kernel source tree (contains Makefile)
+    defconfig_path     : path to defconfig (e.g. arch/arm64/configs/vendor/lavender-perf_defconfig)
+
+Flags:
+    --include-optional  : include optional configurations (UFW/Fail2ban, USER_NS, TMPFS_XATTR, etc.)
+"""
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+# ============================================================
+#  CONFIG DATA — sourced from Kernel-Configuration.md
+# ============================================================
+
+# --- Mandatory (always applied) ---
+MANDATORY_NON_GKI = [
+    # (CONFIG_name, value, comment_header_for_group)
+    # Groups preserved in order for readable defconfig edits
+    ("CONFIG_SYSCTL", "y", "IPC"),
+    ("CONFIG_SYSVIPC", "y", "IPC"),
+    ("CONFIG_POSIX_MQUEUE", "y", "IPC"),
+    ("CONFIG_NAMESPACES", "y", "Namespace"),
+    ("CONFIG_PID_NS", "y", "Namespace"),
+    ("CONFIG_UTS_NS", "y", "Namespace"),
+    ("CONFIG_IPC_NS", "y", "Namespace"),
+    ("CONFIG_SECCOMP", "y", "Seccomp"),
+    ("CONFIG_SECCOMP_FILTER", "y", "Seccomp"),
+    ("CONFIG_CGROUPS", "y", "Cgroup"),
+    ("CONFIG_CGROUP_DEVICE", "y", "Cgroup"),
+    ("CONFIG_CGROUP_PIDS", "y", "Cgroup"),
+    ("CONFIG_MEMCG", "y", "Cgroup"),
+    ("CONFIG_CGROUP_SCHED", "y", "Cgroup"),
+    ("CONFIG_FAIR_GROUP_SCHED", "y", "Cgroup"),
+    ("CONFIG_CGROUP_FREEZER", "y", "Cgroup"),
+    ("CONFIG_CGROUP_NET_PRIO", "y", "Cgroup"),
+    ("CONFIG_DEVTMPFS", "y", "Filesystem"),
+    ("CONFIG_OVERLAY_FS", "y", "Filesystem"),
+    ("CONFIG_TMPFS_POSIX_ACL", "y", "Filesystem"),
+    ("CONFIG_TMPFS_XATTR", "y", "Filesystem"),
+    ("CONFIG_FW_LOADER", "y", "Firmware"),
+    ("CONFIG_FW_LOADER_USER_HELPER", "y", "Firmware"),
+    ("CONFIG_FW_LOADER_COMPRESS", "y", "Firmware"),
+    ("CONFIG_NET_NS", "y", "Network"),
+    ("CONFIG_VETH", "y", "Network"),
+    ("CONFIG_BRIDGE", "y", "Network"),
+    ("CONFIG_NETFILTER", "y", "Network"),
+    ("CONFIG_BRIDGE_NETFILTER", "y", "Network"),
+    ("CONFIG_NETFILTER_ADVANCED", "y", "Network"),
+    ("CONFIG_NF_CONNTRACK", "y", "Network"),
+    ("CONFIG_IP_NF_IPTABLES", "y", "Network"),
+    ("CONFIG_IP_NF_FILTER", "y", "Network"),
+    ("CONFIG_NF_NAT", "y", "Network"),
+    ("CONFIG_NF_TABLES", "y", "Network"),
+    ("CONFIG_IP_NF_TARGET_MASQUERADE", "y", "Network"),
+    ("CONFIG_NETFILTER_XT_TARGET_MASQUERADE", "y", "Network"),
+    ("CONFIG_NETFILTER_XT_TARGET_TCPMSS", "y", "Network"),
+    ("CONFIG_NETFILTER_XT_MATCH_ADDRTYPE", "y", "Network"),
+    ("CONFIG_NF_CONNTRACK_NETLINK", "y", "Network"),
+    ("CONFIG_NF_NAT_REDIRECT", "y", "Network"),
+    ("CONFIG_IP_ADVANCED_ROUTER", "y", "Network"),
+    ("CONFIG_IP_MULTIPLE_TABLES", "y", "Network"),
+    ("CONFIG_NF_CONNTRACK_IPV4", "y", "Legacy"),
+    ("CONFIG_NF_NAT_IPV4", "y", "Legacy"),
+    ("CONFIG_IP_NF_NAT", "y", "Legacy"),
+    # Explicit disable for older kernels (replaces potential =y default)
+    ("CONFIG_ANDROID_PARANOID_NETWORK", "n", "Legacy"),
+    ("CONFIG_USER_NS", "y", "Namespace"),
+]
+
+MANDATORY_GKI = [
+    ("CONFIG_SYSVIPC", "y", "IPC"),
+    ("CONFIG_POSIX_MQUEUE", "y", "IPC"),
+    ("CONFIG_IPC_NS", "y", "Namespace"),
+    ("CONFIG_PID_NS", "y", "Namespace"),
+    ("CONFIG_DEVTMPFS", "y", "Filesystem"),
+    ("CONFIG_NETFILTER_XT_MATCH_ADDRTYPE", "y", "Network"),
+]
+
+OPTIONAL_NON_GKI = [
+    ("CONFIG_NETFILTER_XT_MATCH_COMMENT", "y", "UFW"),
+    ("CONFIG_NETFILTER_XT_MATCH_STATE", "y", "UFW"),
+    ("CONFIG_NETFILTER_XT_MATCH_CONNTRACK", "y", "UFW"),
+    ("CONFIG_NETFILTER_XT_MATCH_MULTIPORT", "y", "UFW"),
+    ("CONFIG_NETFILTER_XT_MATCH_HL", "y", "UFW"),
+    ("CONFIG_NETFILTER_XT_TARGET_REJECT", "y", "Fail2ban"),
+    ("CONFIG_IP_NF_TARGET_REJECT", "y", "Fail2ban"),
+    ("CONFIG_NETFILTER_XT_TARGET_LOG", "y", "UFW"),
+    ("CONFIG_IP_NF_TARGET_ULOG", "y", "Fail2ban"),
+    ("CONFIG_NETFILTER_XT_MATCH_RECENT", "y", "Fail2ban"),
+    ("CONFIG_NETFILTER_XT_MATCH_LIMIT", "y", "UFW"),
+    ("CONFIG_NETFILTER_XT_MATCH_HASHLIMIT", "y", "UFW"),
+    ("CONFIG_NETFILTER_XT_MATCH_OWNER", "y", "Fail2ban"),
+    ("CONFIG_NETFILTER_XT_MATCH_PKTTYPE", "y", "UFW"),
+    ("CONFIG_NETFILTER_XT_MATCH_MARK", "y", "Fail2ban"),
+    ("CONFIG_NETFILTER_XT_TARGET_MARK", "y", "UFW"),
+    ("CONFIG_IP_SET", "y", "Fail2ban"),
+    ("CONFIG_IP_SET_HASH_IP", "y", "Fail2ban"),
+    ("CONFIG_IP_SET_HASH_NET", "y", "Fail2ban"),
+    ("CONFIG_NETFILTER_XT_SET", "y", "Fail2ban"),
+    ("CONFIG_NETFILTER_NETLINK_QUEUE", "y", "UFW"),
+    ("CONFIG_NETFILTER_NETLINK_LOG", "y", "Fail2ban"),
+    ("CONFIG_NETFILTER_XT_TARGET_NFLOG", "y", "UFW"),
+]
+
+OPTIONAL_GKI = [
+    ("CONFIG_USER_NS", "y", "Namespace"),
+    ("CONFIG_TMPFS_POSIX_ACL", "y", "Filesystem"),
+    ("CONFIG_TMPFS_XATTR", "y", "Filesystem"),
+    # UFW subset
+    ("CONFIG_NETFILTER_XT_TARGET_REJECT", "y", "UFW"),
+    ("CONFIG_NETFILTER_XT_TARGET_LOG", "y", "UFW"),
+    ("CONFIG_NETFILTER_XT_MATCH_RECENT", "y", "UFW"),
+    # Fail2ban subset
+    ("CONFIG_IP_SET", "y", "Fail2ban"),
+    ("CONFIG_IP_SET_HASH_IP", "y", "Fail2ban"),
+    ("CONFIG_IP_SET_HASH_NET", "y", "Fail2ban"),
+    ("CONFIG_NETFILTER_XT_SET", "y", "Fail2ban"),
+]
+
+# ==============================================
+#  PATCH RESOLUTION DATA (path relative to repo root / docs/...)
+# ==============================================
+PATCH_DIR = Path(__file__).resolve().parent / "docs" / "Droidspaces-OSS" / "resources" / "kernel-patches"
+
+PATCH_NON_GKI = [
+    PATCH_DIR / "non-GKI" / "01.fix_kernel_panic_in_xt_qtaguid.patch",
+    PATCH_DIR / "non-GKI" / "02.fix_restore cgroup file prefix handling .patch",
+]
+
+PATCH_GKI_BELOW_612 = [
+    PATCH_DIR / "GKI" / "below-kernel-6.12" / "001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch",
+]
+PATCH_GKI_BELOW_612_MQUEUE = [
+    PATCH_DIR / "GKI" / "below-kernel-6.12" / "002.5.10_or_lower_use_android_abi_padding_for_posix_mqueue.patch",
+]
+PATCH_GKI_BELOW_612_ALT_SYSVIPC_VARIANTS = [
+    PATCH_DIR / "GKI" / "below-kernel-6.12" / "001.GKI-below-6.12-fix_sysvipc_kabi_1_2_3.patch",
+    PATCH_DIR / "GKI" / "below-kernel-6.12" / "001.GKI-below-6.12-fix_sysvipc_kabi_3_4_5.patch",
+    PATCH_DIR / "GKI" / "below-kernel-6.12" / "001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch",
+]
+PATCH_GKI_ABOVE_612 = [
+    PATCH_DIR / "GKI" / "kernel-6.12" / "001.GKI-6.12-or-above-fix_sysvipc_kabi.patch",
+]
+
+
+# ==============================================
+#  UTILS
+# ==============================================
+
+def log(s: str, level: str = "info"):
+    tag = {"info":"[INFO]", "warn":"[WARN]", "error":"[ERROR]", "ok":"[OK]"}.get(level, "[INFO]")
+    print(f"{tag} {s}")
+
+
+def get_kernel_version(src_path: Path) -> tuple[int, int, int]:
+    makefile = src_path / "Makefile"
+    if not makefile.exists():
+        # Some trees keep version in makefile fragments; search broadly
+        candidates = list(src_path.rglob("Makefile"))
+        if not candidates:
+            raise SystemExit(f"No Makefile found in kernel source: {src_path}")
+        makefile = candidates[0]
+    text = makefile.read_text()
+    m = re.search(r"VERSION\s*=" + r"\s*(\d+)", text)
+    p = re.search(r"PATCHLEVEL\s*=" + r"\s*(\d+)", text)
+    s = re.search(r"SUBLEVEL\s*=" + r"\s*(\d+)", text)
+    if not m or not p:
+        raise SystemExit(f"Could not extract kernel version from {makefile}")
+    ver = int(m.group(1))
+    patch = int(p.group(1))
+    sub = int(s.group(1)) if s else 0
+    return (ver, patch, sub)
+
+
+def is_gki(src_path: Path) -> bool:
+    # GKI has a dedicated defconfig; but also check version
+    version = get_kernel_version(src_path)
+    has_gki_defconfig = (src_path / "arch" / "arm64" / "configs" / "gki_defconfig").exists()
+    # If kernel version >= 5.4 and gki_defconfig exists => GKI path is safer
+    # Even if defconfig name doesn't say "gki", the presence of the patch targets and version tells the story.
+    # Per docs: GKI applies to 5.4+, 5.10, 5.15, 6.1, 6.6, 6.12+
+    return version[0] >= 5 and version[1] >= 4 or version[0] > 5
+
+
+def detect_gki_variant(src_path: Path) -> tuple[str, bool]:
+    """Returns (variant, needs_mqueue_patch).
+    variant: 'below_612', 'above_612'
+    needs_mqueue_patch: whether <= 5.10 needs the POSIX_MQUEUE kABI fix.
+    """
+    version = get_kernel_version(src_path)
+    needs_mq = (version[0] == 5 and version[1] <= 10) or version[0] < 5
+    # But doc says 5.10 and below ONLY for non-GKI? Actually doc says for GKI:
+    # "For Kernels 5.10 and BELOW ONLY: apply POSIX_MQUEUE kABI fix"
+    # So for GKI, if kernel version <= 5.10, add mqueue.
+    # For non-GKI, no special mqueue patch.
+    needs_mq_gki = True if (version[0] == 5 and version[1] <= 10) or version[0] < 5 else False if version[0] > 5 or (version[0] == 5 and version[1] > 10) else False
+    # Actually the doc says: "For Kernels 5.10 and BELOW ONLY" — that's for GKI kernels.
+    # Non-GKI doesn't have this restriction. We'll only apply GKI-specific patches when in GKI mode.
+    if version[0] > 6 or (version[0] == 6 and version[1] >= 12):
+        return ("above_612", False)
+    else:
+        # 5.4, 5.10, 5.15, 6.1, 6.6 => below 6.12
+        # Mqueue needed only for 5.10 and lower.
+        mq = (version[0] < 5) or (version[0] == 5 and version[1] <= 10)
+        return ("below_612", mq)
+
+
+def read_defconfig(path: Path) -> list[str]:
+    with open(path, "r") as f:
+        return f.read().splitlines(keepends=True)
+
+
+def write_defconfig(path: Path, lines: list[str]):
+    with open(path, "w") as f:
+        f.write("".join(lines))
+
+
+def find_config_line(lines: list[str], name: str) -> int:
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            # Check if it's a commented-out config
+            # Format: # CONFIG_NAME is not set
+            # or # CONFIG_NAME=y
+            m = re.match(r"#\s*(CONFIG_[A-Z_]+)(?:\s+is\s+not\s+set)?", stripped)
+            if m:
+                if m.group(1) == name:
+                    return i
+        else:
+            # Active config line
+            parts = stripped.split("=")
+            if len(parts) == 2 and parts[0].strip() == name:
+                return i
+    return -1
+
+
+def modify_config_line(line: str, value: str) -> str:
+    """Replace value in a config line, preserving whitespace and comments in line.
+    Handles:
+      CONFIG_X=y  -> CONFIG_X=<value>
+      # CONFIG_X is not set  -> # CONFIG_X is not set (if value=n, keep as is)
+      # CONFIG_X=y  -> # CONFIG_X=y (adjust)
+    Actually for disabled (n), standard is '# CONFIG_X is not set'.
+    For enabled (y), standard is 'CONFIG_X=y'.
+    We'll follow kernel defconfig convention strictly.
+    """
+    stripped = line.strip()
+    # Extract config name regardless of comment/active state
+    name = None
+    if stripped.startswith("#"):
+        # Could be '# CONFIG_X is not set' or '# CONFIG_X=y'
+        inner = stripped.lstrip("#").strip()
+        name = inner.split("=", 1)[0].split()[0] if "=" in inner else inner.split()[0]
+    else:
+        name = stripped.split("=", 1)[0]
+    if value == "n":
+        return line.replace(stripped, f"# {name} is not set")
+    else:
+        return line.replace(stripped, f"{name}={value}")
+
+
+def apply_defconfig_changes(path: Path, configs: list[tuple[str, str, str]], dry_run: bool = False) -> list[dict]:
+    """Apply a list of (CONFIG, value, group_name) to defconfig.
+    Returns list of applied changes (each dict with key/value/action/group).
+    Idempotent: skips if already correct.
+    """
+    if dry_run:
+        log("Dry-run: would check/edit defconfig but no file will be written.")
+    lines = read_defconfig(path)
+    applied = []
+    for cfg_name, cfg_value, group in configs:
+        idx = find_config_line(lines, cfg_name)
+        current_line = lines[idx] if idx >= 0 else None
+        current_value = None
+        if current_line is not None:
+            stripped = current_line.strip()
+            if stripped.startswith("#"):
+                # Disabled or commented
+                # If value is n and it's disabled already -> skip
+                # If value is y but disabled -> enable
+                # If value is n but enabled -> disable
+                m_name = re.search(r"#\s*(CONFIG_[A-Z_]+)", stripped)
+                if m_name:
+                    actual_name = m_name.group(1)
+                    if actual_name == cfg_name:
+                        # Check if 'is not set'
+                        is_disabled = "is not set" in stripped
+                        if cfg_value == "n" and is_disabled:
+                            current_value = "n"
+                        elif cfg_value == "y" and is_disabled:
+                            current_value = "disabled"
+                        elif cfg_value == "n" and not is_disabled:
+                            # enabled when should be disabled? rare
+                            current_value = "y"
+                        else:
+                            current_value = cfg_value if cfg_value == "n" else "y"
+                    else:
+                        current_value = None
+            else:
+                # Active line
+                parts = stripped.split("=")
+                if len(parts) == 2 and parts[0].strip() == cfg_name:
+                    current_value = parts[1].strip()
+                else:
+                    current_value = None
+        else:
+            current_value = None
+
+        if current_value == cfg_value:
+            # Already correct
+            continue
+
+        if not dry_run:
+            # Modify or insert
+            if idx >= 0:
+                new_line = modify_config_line(lines[idx], cfg_value)
+                lines[idx] = new_line
+                applied.append({"key": cfg_name, "value": cfg_value, "action": "modified", "line": idx, "group": group})
+            else:
+                # Append at end (with group comment header if group changes)
+                # For simplicity, append a blank line and the config line.
+                # To keep file clean, we won't add extra comments.
+                new_line_str = f"CONFIG_{cfg_name.split('_', 1)[1]}={cfg_value}" if False else f"{cfg_name}={cfg_value}"
+                # Actually cfg_name is full CONFIG_... name
+                new_line_str = f"{cfg_name}={cfg_value}" if cfg_value != "n" else f"# {cfg_name} is not set"
+                # But if it should be disabled (n), standard defconfig format is '# CONFIG_X is not set'
+                # Already handled by modify_config_line logic for insertion
+                if cfg_value == "n":
+                    new_line_str = f"# {cfg_name} is not set"
+                else:
+                    new_line_str = f"{cfg_name}={cfg_value}"
+                # Append at the very end of file (before any trailing blank lines if clean)
+                # To keep clean, insert before last trailing blank lines.
+                # For simplicity: append with a comment header if new group.
+                # We will just append it directly.
+                # Find last non-empty line index
+                last_non_empty = len(lines) - 1
+                while last_non_empty >= 0 and lines[last_non_empty].strip() == "":
+                    last_non_empty -= 1
+                insert_pos = last_non_empty + 1
+                # Add a blank line before new config if file doesn't end with blank
+                if insert_pos < len(lines) and lines[insert_pos - 1].strip() != "":
+                    lines.insert(insert_pos, "")
+                    insert_pos += 1
+                # Insert the new config line
+                lines.insert(insert_pos, new_line_str + "\n")
+                # Update index tracking: we don't track inserted lines (simple approach)
+                applied.append({"key": cfg_name, "value": cfg_value, "action": "added", "line": insert_pos, "group": group})
+        # After processing all configs, write back the file (if not dry-run)
+        if not dry_run:
+            write_defconfig(path, lines)
+    else:
+        # In dry-run, just compute what would change
+        for cfg_name, cfg_value, group in configs:
+            idx = find_config_line(lines, cfg_name)
+            current_line = lines[idx] if idx >= 0 else None
+            current_value = None
+            if current_line is not None:
+                stripped = current_line.strip()
+                if stripped.startswith("#"):
+                    m_name = re.search(r"#\s*(CONFIG_[A-Z_]+)", stripped)
+                    if m_name and m_name.group(1) == cfg_name:
+                        is_disabled = "is not set" in stripped
+                        if cfg_value == "n" and is_disabled:
+                            current_value = "n"
+                        elif cfg_value == "y" and is_disabled:
+                            current_value = "disabled"
+                        else:
+                            current_value = cfg_value if cfg_value == "n" else "y"
+                else:
+                    parts = stripped.split("=")
+                    if len(parts) == 2 and parts[0].strip() == cfg_name:
+                        current_value = parts[1].strip()
+            if current_value != cfg_value:
+                applied.append({"key": cfg_name, "value": cfg_value, "action": "would-change", "group": group, "line": idx})
+    return applied
+
+
+def resolve_patches_for_kernel(src_path: Path, is_gki_flag: bool) -> list[Path]:
+    if is_gki_flag:
+        version = get_kernel_version(src_path)
+        variant, mq = detect_gki_variant(src_path)
+        patches = []
+        if variant == "above_612":
+            # Try 6.12 patch; fall back to below if file missing
+            p = PATCH_GKI_ABOVE_612[0]
+            if p.exists():
+                patches.append(p)
+            else:
+                log(f"GKI 6.12+ patch not found at {p}; using below-6.12 fallback", "warn")
+                # Fallback: try below-612 primary
+                p_fallback = PATCH_GKI_BELOW_612[0]
+                if p_fallback.exists():
+                    patches.append(p_fallback)
+        else:
+            # Try primary 6_7_8 variant
+            primary = PATCH_GKI_BELOW_612[0]
+            if primary.exists():
+                patches.append(primary)
+            else:
+                # Fallback to alt variants
+                for alt in PATCH_GKI_BELOW_612_ALT_SYSVIPC_VARIANTS:
+                    if alt.exists():
+                        patches.append(alt)
+                        break
+            if mq:
+                # Apply mqueue fix for <= 5.10 GKI
+                mq_patch = PATCH_GKI_BELOW_612_MQUEUE[0]
+                if mq_patch.exists():
+                    patches.append(mq_patch)
+                else:
+                    log("GKI mqueue patch not found; continuing.", "warn")
+        return patches
+    else:
+        patches = []
+        for p in PATCH_NON_GKI:
+            if p.exists():
+                patches.append(p)
+            else:
+                log(f"Non-GKI patch not found: {p}", "warn")
+        return patches
+
+
+# ==============================================
+#  PATCH APPLICATION (idempotent, safe)
+# ==============================================
+
+def apply_patch(patch_path: Path, src_path: Path, dry_run: bool = False) -> dict:
+    """Apply a single patch using `patch -p1` command in src_path.
+    Returns result dict with keys: applied, skipped, failed, message.
+    """
+    # Check if patch file exists
+    if not patch_path.exists():
+        return {"applied": False, "skipped": False, "failed": True, "message": f"Patch file not found: {patch_path}"}
+
+    # Build command: change to src_path and run patch -p1 -i <patch_path>
+    cmd = ["patch", "-p1", "-i", str(patch_path.resolve()), "--quiet"]
+    # We use a temporary working directory approach: set cwd=src_path
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=str(src_path.resolve()),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except Exception as e:
+        return {"applied": False, "skipped": False, "failed": True, "message": str(e)}
+
+    if result.returncode == 0:
+        return {"applied": True, "skipped": False, "failed": False, "message": "Applied cleanly."}
+    elif result.returncode == 1:
+        # Patch may have been partially applied or refused; check stdout/stderr for clues.
+        out = result.stdout + result.stderr
+        # If it says "Reversed (or previously applied) patch detected" or similar -> skip
+        # If it says "Hunk #1 succeeded" but then "Hunk #2 failed" -> partial fail.
+        if "already applied" in out.lower() or "reversed" in out.lower():
+            return {"applied": False, "skipped": True, "failed": False, "message": "Already applied; skipped."}
+        return {"applied": False, "skipped": False, "failed": True, "message": f"Patch failed: {out[:500]}"}
+    else:
+        return {"applied": False, "skipped": False, "failed": True, "message": f"Unexpected return code {result.returncode}: {result.stderr}"}
+
+
+def apply_all_patches(src_path: Path, is_gki_flag: bool, dry_run: bool) -> dict:
+    patches = resolve_patches_for_kernel(src_path, is_gki_flag)
+    results = []
+    for p in patches:
+        if dry_run:
+            # In dry-run, check if file exists and simulate (don't actually run patch)
+            results.append({"file": str(p), "applied": False, "skipped": False, "message": "Dry-run: would attempt.", "dry_run": True})
+            continue
+        res = apply_patch(p, src_path, dry_run=False)
+        res["file"] = str(p.name)
+        results.append(res)
+    # Compute aggregate
+    applied_count = sum(1 for r in results if r.get("applied"))
+    skipped_count = sum(1 for r in results if r.get("skipped"))
+    failed_count = sum(1 for r in results if r.get("failed"))
+    return {
+        "results": results,
+        "applied": applied_count,
+        "skipped": skipped_count,
+        "failed": failed_count,
+    }
+
+
+def backup_defconfig(path: Path):
+    backup_path = Path(str(path) + ".bak")
+    if not backup_path.exists():
+        shutil.copy2(path, backup_path)
+        log(f"Backup created: {backup_path}", "info")
+    else:
+        log(f"Backup exists (not overwritten): {backup_path}", "info")
+    return backup_path
+
+
+# ==============================================
+#  MAIN
+# ==============================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Install Droidspaces OSS kernel configurations and patches.",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    parser.add_argument("kernel_source", type=str, help="Path to kernel source directory (contains Makefile)")
+    parser.add_argument("defconfig_path", type=str, help="Path to defconfig file (e.g. arch/arm64/configs/vendor/whyred-perf_defconfig)")
+    parser.add_argument("--include-optional", action="store_true", help="Include optional configurations (UFW, Fail2ban, USER_NS, TMPFS_XATTR, TMPFS_POSIX_ACL, etc.)")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would be done without making changes.")
+    args = parser.parse_args()
+
+    # Validate paths
+    src_path = Path(args.kernel_source)
+    defconfig_path = Path(args.defconfig_path)
+
+    if not src_path.is_dir():
+        print(f"[ERROR] Kernel source directory does not exist: {src_path}", file=sys.stderr)
+        sys.exit(1)
+
+    if not defconfig_path.is_file():
+        print(f"[ERROR] Defconfig file does not exist: {defconfig_path}", file=sys.stderr)
+        sys.exit(2)
+
+    # Detect kernel version and GKI status
+    try:
+        kernel_version = get_kernel_version(src_path)
+    except SystemExit as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(3)
+
+    log(f"Detected kernel version: {'.'.join(str(x) for x in kernel_version)}")
+    gki = is_gki(src_path)
+    log(f"GKI mode detected: {gki}")
+
+    # Resolve patches for this kernel
+    patch_results = apply_all_patches(src_path, gki, args.dry_run)
+
+    # Print patch results clearly
+    for res in patch_results.get("results", []):
+        status_symbol = "[OK]" if res.get("applied") else ("[SKIP]" if res.get("skipped") else "[FAIL]")
+        msg = res.get("message", "")
+        print(f"{status_symbol} Patch: {res.get('file', '?')} -> {msg}")
+
+    if patch_results.get("failed", 0) > 0:
+        log("Some patches failed. Review above.", "warn")
+
+    # Select configurations based on mode and option
+    configs_to_apply: list = []
+    if gki:
+        # GKI mode: only use mandatory GKI configs (and optional if flag)
+        configs_to_apply.extend(MANDATORY_GKI)
+        if args.include_optional:
+            configs_to_apply.extend(OPTIONAL_GKI)
+    else:
+        # Non-GKI mode: use full mandatory list (and optional if flag)
+        configs_to_apply.extend(MANDATORY_NON_GKI)
+        if args.include_optional:
+            configs_to_apply.extend(OPTIONAL_NON_GKI)
+
+    # Apply defconfig edits
+    # Always make a backup (unless dry-run, but we don't actually write in dry-run)
+    if not args.dry_run:
+        backup_defconfig(defconfig_path)
+
+    changes = apply_defconfig_changes(defconfig_path, configs_to_apply, dry_run=args.dry_run)
+
+    # Print results
+    if changes:
+        modified = [c for c in changes if c["action"] in ("modified", "added") and c.get("dry_run") is not True]
+        dry_changes = [c for c in changes if c.get("action") in ("modified", "added") and c.get("dry_run") is True]
+        actual_mods = [c for c in changes if c.get("action") in ("modified", "added") and c.get("dry_run") is not True or (not args.dry_run and "key" in c)]
+        # For simplicity: list all changes
+        groups_applied = sorted({c.get("group", "Other") for c in changes})
+        log(f"Configurations applied (groups): {', '.join(groups_applied)}")
+        for c in changes:
+            action_tag = "[DRY]" if args.dry_run and ("key" in c) else ("[ADD]" if c.get("action") == "added" else "[MOD]")
+            log(f"{action_tag} {c.get('key', '?')} = {c.get('value', '?')} (group: {c.get('group', '?')})")
+    else:
+        log("No configuration changes needed (already set correctly).")
+
+    # Final summary
+    total_patches = len(patch_results.get("results", []))
+    total_applied_patches = patch_results.get("applied", 0)
+    total_failed_patches = patch_results.get("failed", 0)
+    total_configs = len(configs_to_apply)
+    total_config_changes = len(changes)
+
+    log(f"Summary:")
+    log(f"  Kernel version: {'.'.join(str(x) for x in kernel_version)}")
+    log(f"  GKI mode: {gki}")
+    log(f"  Optional included: {args.include_optional}")
+    log(f"  Patches: {total_applied_patches}/{total_patches} applied; {total_failed_patches} failed.")
+    log(f"  Configs checked: {total_configs}; modified/added: {total_config_changes}.")
+    log(f"  Dry-run mode: {args.dry_run}")
+    if args.dry_run:
+        log("No files were modified (dry-run mode).")
+    else:
+        log("Installation complete.")
+        log(f"Defconfig edited: {defconfig_path}")
+
+
+if __name__ == "__main__":
+    main()

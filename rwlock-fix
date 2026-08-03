@@ -1,0 +1,62 @@
+#!/bin/bash
+# rwlock-fix: Fix mixed rwlock/rwsem usage in mm/vmscan.c
+# Usage: rwlock-fix [path to source kernel folder]
+
+set -euo pipefail
+
+KDIR="${1:-.}"
+FILE="$KDIR/mm/vmscan.c"
+
+if [ ! -f "$FILE" ]; then
+    echo "Error: $FILE not found" >&2
+    exit 1
+fi
+
+if [ ! -w "$FILE" ]; then
+    echo "Error: $FILE is not writable" >&2
+    exit 1
+fi
+
+# Idempotency: if already fixed, skip
+if grep -q 'static DECLARE_RWSEM(shrinker_rwsem);' "$FILE"; then
+    echo "Already fixed: $FILE"
+    exit 0
+fi
+
+# Check broken pattern exists
+if ! grep -q 'DEFINE_RWLOCK(shrinker_rwlock)' "$FILE"; then
+    echo "Warning: broken pattern not found in $FILE, may already be fixed or different version" >&2
+fi
+
+# Backup
+cp -f "$FILE" "$FILE.bak.rwfix"
+
+# Apply fix safely: only if broken declaration present
+if grep -q 'DEFINE_RWLOCK(shrinker_rwlock)' "$FILE"; then
+    sed -i 's/static DEFINE_RWLOCK(shrinker_rwlock);/static DECLARE_RWSEM(shrinker_rwsem);/' "$FILE"
+fi
+
+# Only run replacements if shrinker_rwlock still exists (partial fix scenario)
+if grep -q 'shrinker_rwlock' "$FILE"; then
+    sed -i \
+        -e 's/shrinker_rwlock/shrinker_rwsem/g' \
+        -e 's/write_lock(&shrinker_rwsem)/down_write(\&shrinker_rwsem)/g' \
+        -e 's/write_unlock(&shrinker_rwsem)/up_write(\&shrinker_rwsem)/g' \
+        -e 's/read_lock(&shrinker_rwsem)/down_read(\&shrinker_rwsem)/g' \
+        -e 's/read_unlock(&shrinker_rwsem)/up_read(\&shrinker_rwsem)/g' \
+        -e 's/rwlock_is_contended(&shrinker_rwsem)/rwsem_is_contended(\&shrinker_rwsem)/g' \
+        "$FILE"
+fi
+
+# Verify no leftover broken references
+if grep -q 'shrinker_rwlock' "$FILE"; then
+    echo "Warning: leftover shrinker_rwlock references found in $FILE" >&2
+fi
+
+# Verify syntax sanity: no undefined macros
+if grep -q 'DEFINE_RWSEM' "$FILE"; then
+    echo "Error: DEFINE_RWSEM still present (should be DECLARE_RWSEM)" >&2
+    exit 1
+fi
+
+echo "Fixed $FILE (backup: $FILE.bak.rwfix)"
