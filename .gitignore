@@ -18,3 +18,5 @@ san_scripts/
 *.zip
 *.devconfig
 crdroid/
+kernels/
+*-dtb
