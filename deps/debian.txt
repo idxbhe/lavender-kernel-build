@@ -1,1 +1,0 @@
-cpio flex bison bc libarchive-tools zstd wget curl git make libssl-dev openssl

@@ -2,7 +2,7 @@
 """
 drspace-install — Install Droidspaces OSS kernel configurations.
 Usage:
-    ./drspace-install <kernel_source_path> <defconfig_path> [--include-optional]
+    ./drspace-install <kernel_source_path> <defconfig_path> [--include-optional] [--skip-patch]
 
 Arguments:
     kernel_source_path : path to kernel source tree (contains Makefile)
@@ -10,6 +10,7 @@ Arguments:
 
 Flags:
     --include-optional  : include optional configurations (UFW/Fail2ban, USER_NS, TMPFS_XATTR, etc.)
+    --skip-patch        : skip patching step, only configure defconfig
 """
 
 import argparse
@@ -473,7 +474,9 @@ def apply_patch(patch_path: Path, src_path: Path, dry_run: bool = False) -> dict
         return {"applied": False, "skipped": False, "failed": True, "message": f"Unexpected return code {result.returncode}: {result.stderr}"}
 
 
-def apply_all_patches(src_path: Path, is_gki_flag: bool, dry_run: bool) -> dict:
+def apply_all_patches(src_path: Path, is_gki_flag: bool, dry_run: bool, skip_patch: bool) -> dict:
+    if skip_patch:
+        return {"results": [], "applied": 0, "skipped": 0, "failed": 0}
     patches = resolve_patches_for_kernel(src_path, is_gki_flag)
     results = []
     for p in patches:
@@ -519,6 +522,7 @@ def main():
     parser.add_argument("defconfig_path", type=str, help="Path to defconfig file (e.g. arch/arm64/configs/vendor/whyred-perf_defconfig)")
     parser.add_argument("--include-optional", action="store_true", help="Include optional configurations (UFW, Fail2ban, USER_NS, TMPFS_XATTR, TMPFS_POSIX_ACL, etc.)")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be done without making changes.")
+    parser.add_argument("--skip-patch", action="store_true", help="Skip patching step, only configure defconfig.")
     args = parser.parse_args()
 
     # Validate paths
@@ -545,7 +549,7 @@ def main():
     log(f"GKI mode detected: {gki}")
 
     # Resolve patches for this kernel
-    patch_results = apply_all_patches(src_path, gki, args.dry_run)
+    patch_results = apply_all_patches(src_path, gki, args.dry_run, args.skip_patch)
 
     # Print patch results clearly
     for res in patch_results.get("results", []):
@@ -601,6 +605,7 @@ def main():
     log(f"  Kernel version: {'.'.join(str(x) for x in kernel_version)}")
     log(f"  GKI mode: {gki}")
     log(f"  Optional included: {args.include_optional}")
+    log(f"  Skip patch: {args.skip_patch}")
     log(f"  Patches: {total_applied_patches}/{total_patches} applied; {total_failed_patches} failed.")
     log(f"  Configs checked: {total_configs}; modified/added: {total_config_changes}.")
     log(f"  Dry-run mode: {args.dry_run}")

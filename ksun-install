@@ -1,0 +1,1004 @@
+#!/usr/bin/env bash
+# ksun-install - KernelSU Next Legacy/Non-GKI Integration Script
+# Production-ready, robust implementation following official documentation
+#
+# Usage: ksun-install <method> <kernel_source_dir> <defconfig_path>
+#   method: manual | kprobe
+#   kernel_source_dir: path to kernel source tree (must be writable)
+#   defconfig_path: path to defconfig file (relative to kernel source or absolute)
+
+set -euo pipefail
+
+# ============================================================================
+# Constants & Configuration
+# ============================================================================
+readonly SCRIPT_NAME="$(basename "$0")"
+readonly SCRIPT_VERSION="1.0.0"
+readonly KSU_SETUP_URL="https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh"
+readonly KSU_LEGACY_BRANCH="legacy"
+
+# Options
+SKIP_KSU_FETCH=0
+
+# Required kernel configs for kprobe method
+readonly KPROBE_CONFIGS=(
+    "CONFIG_KPROBES=y"
+    "CONFIG_KPROBE_EVENTS=y"
+    "CONFIG_KSU_KPROBE_HOOKS=y"
+    "CONFIG_KSU=y"
+)
+
+# Required kernel config for manual method
+readonly MANUAL_CONFIG="CONFIG_KSU=y"
+
+# Files to patch for manual integration (relative to kernel source root)
+readonly MANUAL_PATCH_FILES=(
+    "fs/exec.c"
+    "fs/open.c"
+    "fs/read_write.c"
+    "fs/stat.c"
+    "kernel/reboot.c"
+)
+
+# ============================================================================
+# Logging & Output Functions
+# ============================================================================
+log_info()    { printf '\033[1;34m[INFO]\033[0m  %s\n' "$*"; }
+log_success() { printf '\033[1;32m[OK]\033[0m   %s\n' "$*"; }
+log_warn()    { printf '\033[1;33m[WARN]\033[0m  %s\n' "$*"; }
+log_error()   { printf '\033[1;31m[ERROR]\033[0m %s\n' "$*" >&2; }
+log_debug()   { [[ "${DEBUG:-0}" -eq 1 ]] && printf '\033[1;36m[DEBUG]\033[0m %s\n' "$*"; return 0; }
+log_step()    { printf '\n\033[1;35m>>> %s\033[0m\n' "$*"; }
+
+die() {
+    log_error "$*"
+    exit 1
+}
+
+# ============================================================================
+# Patch Helper Functions
+# ============================================================================
+detect_indent() {
+    local file="$1"
+    local line="$2"
+    local indent=""
+    local char
+    char=$(sed -n "${line}p" "$file" | sed -n 's/^\([ \t]*\).*/\1/p')
+    if [[ -n "$char" ]]; then
+        indent="$char"
+    else
+        indent="    "
+    fi
+    echo "$indent"
+}
+
+find_function_start() {
+    local file="$1"
+    local pattern="$2"
+    local start_line="${3:-1}"
+    awk -v start="$start_line" -v pat="$pattern" '
+        NR >= start && $0 ~ pat { print NR; exit }
+    ' "$file"
+}
+
+find_function_end() {
+    local file="$1"
+    local start_line="$2"
+    local pattern="$3"
+    awk -v start="$start_line" -v pat="$pattern" '
+        NR >= start && $0 ~ pat { print NR; exit }
+    ' "$file"
+}
+
+find_next_line_matching() {
+    local file="$1"
+    local start_line="$2"
+    local pattern="$3"
+    awk -v start="$start_line" -v pat="$pattern" '
+        NR > start && $0 ~ pat { print NR; exit }
+    ' "$file"
+}
+
+insert_before_line() {
+    local file="$1"
+    local line_num="$2"
+    local content="$3"
+    local indent="${4:-}"
+    # Use a temporary file for multiline content to avoid sed escaping issues.
+    # `sed "${N}r file"` appends content AFTER line N, so to insert content
+    # BEFORE line `line_num` we target line (`line_num - 1`).
+    local tmp_file
+    tmp_file=$(mktemp)
+    printf '%s\n' "$content" > "$tmp_file"
+    if [[ $line_num -le 1 ]]; then
+        local out_file
+        out_file=$(mktemp)
+        cat "$tmp_file" "$file" > "$out_file"
+        mv "$out_file" "$file"
+    else
+        sed -i "$((line_num - 1))r $tmp_file" "$file"
+    fi
+    rm -f "$tmp_file"
+}
+
+insert_after_line() {
+    local file="$1"
+    local line_num="$2"
+    local content="$3"
+    local indent="${4:-}"
+    local tmp_file
+    tmp_file=$(mktemp)
+    printf '%s\n' "$content" > "$tmp_file"
+    sed -i "${line_num}r $tmp_file" "$file"
+    rm -f "$tmp_file"
+}
+
+patch_with_fallback() {
+    local file="$1"
+    local patterns=("${@:2}")
+    local result=""
+    
+    for pattern in "${patterns[@]}"; do
+        result=$(find_function_start "$file" "$pattern")
+        [[ -n "$result" ]] && { echo "$result"; return 0; }
+    done
+    return 1
+}
+
+verify_patch_applied() {
+    local file="$1"
+    local hook_pattern="$2"
+    grep -q "$hook_pattern" "$file"
+}
+
+backup_and_verify() {
+    local file="$1"
+    local backup_pattern="${file}.ksun-backup.*"
+    local existing_backup
+    existing_backup=$(ls -t ${backup_pattern} 2>/dev/null | head -1)
+    
+    if [[ -n "$existing_backup" ]]; then
+        log_debug "Using existing backup: $existing_backup"
+        echo "$existing_backup"
+        return 0
+    fi
+    
+    local backup
+    backup=$(backup_file "$file")
+    [[ -f "$backup" ]] || { log_error "Failed to create backup for $file"; return 1; }
+    echo "$backup"
+    return 0
+}
+
+# ============================================================================
+# Utility Functions
+# ============================================================================
+show_usage() {
+    cat <<EOF
+Usage: $SCRIPT_NAME [options] <method> <kernel_source_dir> <defconfig_path>
+
+Integrate KernelSU Next (legacy/non-GKI) into a kernel source tree.
+
+Arguments:
+  method            Integration method: 'manual' or 'kprobe'
+  kernel_source_dir Path to kernel source tree (must exist and be writable)
+  defconfig_path    Path to defconfig file (relative to kernel source or absolute)
+
+Options:
+  --skip-ksu-fetch  Skip fetching/updating KernelSU Next source (use existing)
+
+Methods:
+  kprobe   - Uses kprobe hooks (recommended if kprobe works on your kernel)
+             Requires: CONFIG_KPROBES, CONFIG_KPROBE_EVENTS, CONFIG_KSU_KPROBE_HOOKS
+  manual   - Direct source code patches (for kernels where kprobe is broken
+             or kernel version < 4.14)
+
+Examples:
+  $SCRIPT_NAME kprobe /path/to/kernel arch/arm64/configs/vendor/lavender_defconfig
+  $SCRIPT_NAME manual /path/to/kernel arch/arm64/configs/lavender_defconfig
+  $SCRIPT_NAME --skip-ksu-fetch manual /path/to/kernel arch/arm64/configs/lavender_defconfig
+
+Notes:
+  - Kernel source must be buildable (bootable kernel from source)
+  - For manual method: patches 5 kernel files with KSU hooks
+  - For kprobe method: enables required kprobe configs in defconfig
+  - Run from kernel source root or provide absolute paths
+EOF
+}
+
+validate_args() {
+    [[ $# -ge 3 ]] || { show_usage; die "Expected at least 3 arguments, got $#"; }
+
+    # Parse optional flags
+    local args=()
+    for arg in "$@"; do
+        case "$arg" in
+            --skip-ksu-fetch) SKIP_KSU_FETCH=1 ;;
+            *) args+=("$arg") ;;
+        esac
+    done
+
+    [[ ${#args[@]} -eq 3 ]] || { show_usage; die "Expected 3 arguments (method, kernel_source_dir, defconfig_path), got ${#args[@]}"; }
+
+    METHOD="${args[0]}"
+    KERNEL_SRC="$(realpath "${args[1]}")"
+    DEFCONFIG_INPUT="${args[2]}"
+
+    [[ "$METHOD" == "manual" || "$METHOD" == "kprobe" ]] \
+        || die "Invalid method: '$METHOD'. Must be 'manual' or 'kprobe'"
+
+    [[ -d "$KERNEL_SRC" ]] || die "Kernel source directory not found: $KERNEL_SRC"
+    [[ -w "$KERNEL_SRC" ]] || die "Kernel source directory not writable: $KERNEL_SRC"
+
+    # Resolve defconfig path
+    if [[ "$DEFCONFIG_INPUT" = /* ]]; then
+        DEFCONFIG_PATH="$DEFCONFIG_INPUT"
+    else
+        DEFCONFIG_PATH="$KERNEL_SRC/$DEFCONFIG_INPUT"
+    fi
+
+    [[ -f "$DEFCONFIG_PATH" ]] || die "Defconfig not found: $DEFCONFIG_PATH"
+    [[ -w "$DEFCONFIG_PATH" ]] || die "Defconfig not writable: $DEFCONFIG_PATH"
+
+    log_debug "Method: $METHOD"
+    log_debug "Kernel source: $KERNEL_SRC"
+    log_debug "Defconfig: $DEFCONFIG_PATH"
+    log_debug "Skip KSU fetch: $SKIP_KSU_FETCH"
+}
+
+# ============================================================================
+# Pre-flight Detection
+# ============================================================================
+detect_existing_ksu() {
+    log_step "Detecting existing KernelSU integration"
+    
+    local has_ksu_source=0
+    local has_manual_patches=0
+    local has_kprobe_configs=0
+    local has_ksu_config=0
+    local manual_patched_files=()
+    local kprobe_configs_found=()
+    local kprobe_configs_missing=()
+    
+    # Check KernelSU-Next source
+    if [[ -d "$KERNEL_SRC/KernelSU-Next" ]] && [[ -L "$KERNEL_SRC/drivers/kernelsu" ]]; then
+        has_ksu_source=1
+        log_info "KernelSU-Next source detected: $KERNEL_SRC/KernelSU-Next"
+    fi
+    
+    # Check manual patches in kernel source
+    for file in "${MANUAL_PATCH_FILES[@]}"; do
+        local filepath="$KERNEL_SRC/$file"
+        if [[ -f "$filepath" ]] && grep -q "ksu_handle_" "$filepath"; then
+            manual_patched_files+=("$file")
+            has_manual_patches=1
+        fi
+    done
+    
+    if [[ ${#manual_patched_files[@]} -gt 0 ]]; then
+        log_info "Manual patches detected in: ${manual_patched_files[*]}"
+    fi
+    
+    # Check defconfig for KSU config
+    if grep -q "^CONFIG_KSU=y" "$DEFCONFIG_PATH"; then
+        has_ksu_config=1
+        log_info "CONFIG_KSU=y found in defconfig"
+    fi
+    
+    # Check defconfig for kprobe configs
+    for config in "${KPROBE_CONFIGS[@]}"; do
+        local key="${config%%=*}"
+        if grep -q "^${key}=y" "$DEFCONFIG_PATH"; then
+            kprobe_configs_found+=("$key")
+            has_kprobe_configs=1
+        else
+            kprobe_configs_missing+=("$key")
+        fi
+    done
+    
+    if [[ ${#kprobe_configs_found[@]} -gt 0 ]]; then
+        log_info "Kprobe configs enabled: ${kprobe_configs_found[*]}"
+    fi
+    if [[ ${#kprobe_configs_missing[@]} -gt 0 ]]; then
+        log_debug "Kprobe configs not set: ${kprobe_configs_missing[*]}"
+    fi
+    
+    # Determine existing integration method
+    local existing_method="none"
+    if [[ $has_manual_patches -eq 1 && $has_kprobe_configs -eq 1 ]]; then
+        existing_method="both (hybrid)"
+        log_warn "Hybrid integration detected: manual patches + kprobe configs both present"
+    elif [[ $has_manual_patches -eq 1 ]]; then
+        existing_method="manual"
+        log_info "Existing integration method: manual patches"
+    elif [[ $has_kprobe_configs -eq 1 && $has_ksu_config -eq 1 ]]; then
+        existing_method="kprobe"
+        log_info "Existing integration method: kprobe"
+    elif [[ $has_ksu_source -eq 1 ]]; then
+        existing_method="source-only"
+        log_info "KernelSU source present but no integration detected"
+    fi
+    
+    # Warn if switching methods
+    if [[ "$existing_method" != "none" && "$existing_method" != "source-only" ]]; then
+        if [[ "$METHOD" == "manual" && "$existing_method" == "kprobe" ]]; then
+            log_warn "Switching from kprobe to manual method"
+            log_info "  - Kprobe configs will be disabled: CONFIG_KSU_KPROBE_HOOKS, CONFIG_KPROBES, CONFIG_KPROBE_EVENTS"
+            log_info "  - Manual patches will be applied/verified on 5 kernel files"
+        elif [[ "$METHOD" == "kprobe" && "$existing_method" == "manual" ]]; then
+            log_warn "Switching from manual to kprobe method"
+            log_info "  - Manual patches will remain in source (harmless but unused)"
+            log_info "  - Kprobe configs will be enabled"
+        elif [[ "$METHOD" == "manual" && "$existing_method" == "both (hybrid)" ]]; then
+            log_warn "Hybrid detected, enforcing manual method"
+            log_info "  - Kprobe configs will be disabled"
+        elif [[ "$METHOD" == "kprobe" && "$existing_method" == "both (hybrid)" ]]; then
+            log_warn "Hybrid detected, enforcing kprobe method"
+            log_info "  - Kprobe configs will be enabled"
+        fi
+    fi
+    
+    # Export for use in other functions
+    export KSUN_EXISTING_METHOD="$existing_method"
+    export KSUN_HAS_KSU_SOURCE="$has_ksu_source"
+    export KSUN_HAS_MANUAL_PATCHES="$has_manual_patches"
+    export KSUN_HAS_KPROBE_CONFIGS="$has_kprobe_configs"
+    export KSUN_HAS_KSU_CONFIG="$has_ksu_config"
+}
+
+check_prerequisites() {
+    log_step "Checking prerequisites"
+
+    local missing=()
+    for cmd in curl git make grep sed awk find; do
+        command -v "$cmd" >/dev/null || missing+=("$cmd")
+    done
+
+    [[ ${#missing[@]} -eq 0 ]] || die "Missing required commands: ${missing[*]}"
+
+    # Verify it's a kernel source tree
+    [[ -f "$KERNEL_SRC/Makefile" && -f "$KERNEL_SRC/Kconfig" ]] \
+        || die "Not a valid kernel source tree: $KERNEL_SRC"
+
+    log_success "Prerequisites satisfied"
+}
+
+backup_file() {
+    local file="$1"
+    local backup="${file}.ksun-backup.$(date +%Y%m%d_%H%M%S)"
+    cp -p "$file" "$backup"
+    log_debug "Backed up $file to $backup"
+    echo "$backup"
+}
+
+restore_backup() {
+    local file="$1"
+    local backup_pattern="${file}.ksun-backup.*"
+    local latest_backup
+    latest_backup=$(ls -t ${backup_pattern} 2>/dev/null | head -1)
+    if [[ -n "$latest_backup" && -f "$latest_backup" ]]; then
+        cp -p "$latest_backup" "$file"
+        log_warn "Restored $file from backup: $latest_backup"
+    fi
+}
+
+# ============================================================================
+# KernelSU Next Source Integration
+# ============================================================================
+fetch_ksu_source() {
+    log_step "Fetching KernelSU Next source (legacy branch)"
+
+    cd "$KERNEL_SRC"
+
+    # Check if already integrated - KernelSU-Next creates KernelSU-Next dir and drivers/kernelsu symlink
+    if [[ -d "KernelSU-Next" ]] && [[ -L "drivers/kernelsu" ]]; then
+        log_info "KernelSU Next already present."
+        if [[ $SKIP_KSU_FETCH -eq 0 ]]; then
+            log_info "Updating (use --skip-ksu-fetch to skip)..."
+            git -C "KernelSU-Next" fetch origin 2>/dev/null || log_warn "Git fetch failed (network issue?), continuing with existing source"
+            git -C "KernelSU-Next" checkout "$KSU_LEGACY_BRANCH" 2>/dev/null || true
+            git -C "KernelSU-Next" pull origin "$KSU_LEGACY_BRANCH" 2>/dev/null || true
+        else
+            log_info "Skipping fetch/update (--skip-ksu-fetch specified)"
+        fi
+    else
+        if [[ $SKIP_KSU_FETCH -eq 1 ]]; then
+            die "KernelSU-Next not found and --skip-ksu-fetch specified. Run without --skip-ksu-fetch first, or manually add KernelSU source."
+        fi
+        log_info "Running KernelSU Next setup script (legacy branch)..."
+        curl -LSs "$KSU_SETUP_URL" | bash -s "$KSU_LEGACY_BRANCH"
+    fi
+
+    [[ -d "KernelSU-Next" ]] || die "KernelSU source integration failed - KernelSU-Next directory not found"
+    [[ -f "KernelSU-Next/kernel/Kconfig" ]] || die "KernelSU source appears incomplete - Kconfig missing"
+    [[ -f "KernelSU-Next/kernel/core/init.c" ]] || die "KernelSU source appears incomplete - init.c missing"
+
+    log_success "KernelSU Next source integrated"
+}
+
+# ============================================================================
+# Defconfig Management
+# ============================================================================
+update_defconfig() {
+    local configs=("$@")
+    log_step "Updating defconfig: $(basename "$DEFCONFIG_PATH")"
+
+    local backup
+    backup=$(backup_file "$DEFCONFIG_PATH")
+
+    local modified=0
+    for config in "${configs[@]}"; do
+        local key="${config%%=*}"
+        local value="${config#*=}"
+
+        if grep -q "^${key}=" "$DEFCONFIG_PATH"; then
+            local current
+            current=$(grep "^${key}=" "$DEFCONFIG_PATH" | head -1 | cut -d= -f2-)
+            if [[ "$current" != "$value" ]]; then
+                log_info "Updating $key: $current -> $value"
+                if [[ "$value" == "n" ]]; then
+                    sed -i "s|^${key}=.*|# ${key} is not set|" "$DEFCONFIG_PATH"
+                else
+                    sed -i "s|^${key}=.*|${config}|" "$DEFCONFIG_PATH"
+                fi
+                modified=1
+            else
+                log_debug "$key already set to $value"
+            fi
+        elif grep -q "^# ${key} is not set" "$DEFCONFIG_PATH"; then
+            if [[ "$value" == "n" ]]; then
+                log_debug "$key already disabled"
+            else
+                log_info "Enabling $key (was disabled)"
+                sed -i "s|^# ${key} is not set|${config}|" "$DEFCONFIG_PATH"
+                modified=1
+            fi
+        else
+            if [[ "$value" == "n" ]]; then
+                log_info "Disabling $key (adding # $key is not set)"
+                echo "# ${key} is not set" >> "$DEFCONFIG_PATH"
+            else
+                log_info "Adding $config"
+                echo "$config" >> "$DEFCONFIG_PATH"
+            fi
+            modified=1
+        fi
+    done
+
+    # Also ensure CONFIG_KSU is set for both methods
+    if ! grep -q "^CONFIG_KSU=" "$DEFCONFIG_PATH" && ! grep -q "^# CONFIG_KSU is not set" "$DEFCONFIG_PATH"; then
+        echo "$MANUAL_CONFIG" >> "$DEFCONFIG_PATH"
+        modified=1
+    elif grep -q "^# CONFIG_KSU is not set" "$DEFCONFIG_PATH"; then
+        sed -i "s|^# CONFIG_KSU is not set|$MANUAL_CONFIG|" "$DEFCONFIG_PATH"
+        modified=1
+    fi
+
+    if [[ $modified -eq 1 ]]; then
+        log_success "Defconfig updated"
+    else
+        log_info "Defconfig already has required configs"
+    fi
+}
+
+# ============================================================================
+# Manual Method - Patch Application
+# ============================================================================
+apply_manual_patches() {
+    log_step "Applying manual integration patches"
+
+    local patched_files=()
+    local failed_files=()
+
+    for file in "${MANUAL_PATCH_FILES[@]}"; do
+        local filepath="$KERNEL_SRC/$file"
+        [[ -f "$filepath" ]] || { failed_files+=("$file (not found)"); continue; }
+
+        log_info "Patching $file..."
+        if patch_file_manual "$filepath"; then
+            patched_files+=("$file")
+            log_success "Patched $file"
+        else
+            failed_files+=("$file (patch failed)")
+            log_error "Failed to patch $file"
+        fi
+    done
+
+    if [[ ${#failed_files[@]} -gt 0 ]]; then
+        log_error "Failed to patch: ${failed_files[*]}"
+        # Restore backups on failure
+        for file in "${patched_files[@]}"; do
+            restore_backup "$KERNEL_SRC/$file"
+        done
+        die "Manual patching failed. Backups restored."
+    fi
+
+    log_success "All manual patches applied successfully (${#patched_files[@]} files)"
+}
+
+patch_file_manual() {
+    local filepath="$1"
+    local filename="$(basename "$filepath")"
+
+    case "$filename" in
+        exec.c)
+            patch_exec_c "$filepath"
+            ;;
+        open.c)
+            patch_open_c "$filepath"
+            ;;
+        read_write.c)
+            patch_read_write_c "$filepath"
+            ;;
+        stat.c)
+            patch_stat_c "$filepath"
+            ;;
+        reboot.c)
+            patch_reboot_c "$filepath"
+            ;;
+        *)
+            die "Unknown patch target: $filename"
+            ;;
+    esac
+}
+
+# --- Patch: fs/exec.c ---
+patch_exec_c() {
+    local file="$1"
+    
+    if verify_patch_applied "$file" "ksu_handle_execveat"; then
+        log_debug "exec.c already patched, skipping"
+        return 0
+    fi
+    
+    local backup
+    backup=$(backup_and_verify "$file") || return 1
+    
+    local indent
+    indent=$(detect_indent "$file" 1)
+    
+    # Find do_execve function - try multiple patterns
+    local execve_line
+    execve_line=$(patch_with_fallback "$file" \
+        '^[[:space:]]*int[[:space:]]+do_execve[[:space:]]*[(]' \
+        '^[[:space:]]*static[[:space:]]+int[[:space:]]+do_execve[[:space:]]*[(]' \
+        '^[[:space:]]*asmlinkage[[:space:]]+int[[:space:]]+do_execve[[:space:]]*[(]' \
+        '^[[:space:]]*SYSCALL_DEFINE[0-9]*[(]execve'
+    )
+    [[ -n "$execve_line" ]] || { log_error "Could not find do_execve in $file"; return 1; }
+    
+    # Add extern declaration before do_execve
+    local extern_decl="${indent}#ifdef CONFIG_KSU
+${indent}__attribute__((hot))
+${indent}extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
+${indent}                void *argv, void *envp, int *flags);
+${indent}#endif"
+    insert_before_line "$file" "$execve_line" "$extern_decl"
+    
+    # Patch do_execve - find return do_execveat_common
+    local do_execve_end
+    do_execve_end=$(find_function_end "$file" "$execve_line" 'return[[:space:]]+do_execveat_common')
+    if [[ -n "$do_execve_end" ]]; then
+        local hook_call="${indent}#ifdef CONFIG_KSU
+${indent}    ksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);
+${indent}#endif"
+        insert_before_line "$file" "$do_execve_end" "$hook_call"
+    else
+        log_warn "Could not find return in do_execve, trying alternative patterns"
+        # Try finding the closing brace of do_execve
+        do_execve_end=$(awk -v start="$execve_line" '
+            NR >= start && /^[[:space:]]*}[[:space:]]*$/ { print NR; exit }
+        ' "$file")
+        if [[ -n "$do_execve_end" ]]; then
+            local hook_call="${indent}#ifdef CONFIG_KSU
+${indent}    ksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);
+${indent}#endif"
+            insert_before_line "$file" "$do_execve_end" "$hook_call"
+        fi
+    fi
+    
+    # Patch compat_do_execve if exists - try multiple patterns
+    local compat_patterns=(
+        '^[[:space:]]*static[[:space:]]+int[[:space:]]+compat_do_execve[[:space:]]*[(]'
+        '^[[:space:]]*int[[:space:]]+compat_do_execve[[:space:]]*[(]'
+        '^[[:space:]]*asmlinkage[[:space:]]+int[[:space:]]+compat_do_execve[[:space:]]*[(]'
+        '^[[:space:]]*SYSCALL_DEFINE[0-9]*[(]compat_execve'
+    )
+    local compat_line
+    compat_line=$(patch_with_fallback "$file" "${compat_patterns[@]}")
+    
+    if [[ -n "$compat_line" ]]; then
+        local compat_end
+        compat_end=$(find_function_end "$file" "$compat_line" 'return[[:space:]]+do_execveat_common')
+        if [[ -n "$compat_end" ]]; then
+            local hook_call="${indent}#ifdef CONFIG_KSU
+${indent}    ksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);
+${indent}#endif"
+            insert_before_line "$file" "$compat_end" "$hook_call"
+        fi
+    fi
+    
+    # Patch do_execveat if exists - try multiple patterns
+    local do_execveat_patterns=(
+        '^[[:space:]]*int[[:space:]]+do_execveat[[:space:]]*[(]'
+        '^[[:space:]]*static[[:space:]]+int[[:space:]]+do_execveat[[:space:]]*[(]'
+        '^[[:space:]]*asmlinkage[[:space:]]+int[[:space:]]+do_execveat[[:space:]]*[(]'
+        '^[[:space:]]*SYSCALL_DEFINE[0-9]*[(]execveat'
+    )
+    local do_execveat_line
+    do_execveat_line=$(patch_with_fallback "$file" "${do_execveat_patterns[@]}")
+    
+    if [[ -n "$do_execveat_line" ]]; then
+        local do_execveat_end
+        do_execveat_end=$(find_function_end "$file" "$do_execveat_line" 'return[[:space:]]+do_execveat_common')
+        if [[ -n "$do_execveat_end" ]]; then
+            local hook_call="${indent}#ifdef CONFIG_KSU
+${indent}    ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);
+${indent}#endif"
+            insert_before_line "$file" "$do_execveat_end" "$hook_call"
+        fi
+    fi
+    
+    # Verify patch was applied
+    verify_patch_applied "$file" "ksu_handle_execveat" || { log_error "Patch verification failed for exec.c"; return 1; }
+    
+    return 0
+}
+
+# --- Patch: fs/open.c ---
+patch_open_c() {
+    local file="$1"
+    
+    if verify_patch_applied "$file" "ksu_handle_faccessat"; then
+        log_debug "open.c already patched, skipping"
+        return 0
+    fi
+    
+    local backup
+    backup=$(backup_and_verify "$file") || return 1
+    
+    local indent
+    indent=$(detect_indent "$file" 1)
+    
+    # Find do_faccessat or SYSCALL_DEFINE3(faccessat) - try multiple patterns
+    local faccessat_patterns=(
+        '^[[:space:]]*long[[:space:]]+do_faccessat[[:space:]]*[(]'
+        '^[[:space:]]*int[[:space:]]+do_faccessat[[:space:]]*[(]'
+        '^[[:space:]]*static[[:space:]]+long[[:space:]]+do_faccessat[[:space:]]*[(]'
+        '^[[:space:]]*asmlinkage[[:space:]]+long[[:space:]]+do_faccessat[[:space:]]*[(]'
+        '^[[:space:]]*SYSCALL_DEFINE3[[:space:]]*[(][[:space:]]*faccessat'
+    )
+    local faccessat_line
+    faccessat_line=$(patch_with_fallback "$file" "${faccessat_patterns[@]}")
+    [[ -n "$faccessat_line" ]] || { log_error "Could not find do_faccessat/faccessat syscall in $file"; return 1; }
+    
+    # Add extern declaration before do_faccessat
+    local extern_decl="${indent}#ifdef CONFIG_KSU
+${indent}__attribute__((hot))
+${indent}extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,
+${indent}                int *mode, int *flags);
+${indent}#endif"
+    insert_before_line "$file" "$faccessat_line" "$extern_decl"
+    
+# Find the validation check - try multiple patterns
+    local check_patterns=(
+        'if[[:space:]]*[(][[:space:]]*mode[[:space:]]*&[[:space:]]*~S_IRWXO[[:space:]]*[)]'
+        'if[[:space:]]*[(][[:space:]]*mode[[:space:]]*&[[:space:]]*~0777[[:space:]]*[)]'
+        'if[[:space:]]*[(][[:space:]]*mode[[:space:]]*&[[:space:]]*~S_IRWXU[[:space:]]*[)]'
+    )
+    local check_line
+    for pattern in "${check_patterns[@]}"; do
+        check_line=$(find_function_end "$file" "$faccessat_line" "$pattern")
+        [[ -n "$check_line" ]] && break
+    done
+    
+    if [[ -z "$check_line" ]]; then
+        # Fallback: find first if statement in function
+        check_line=$(find_function_end "$file" "$faccessat_line" '^[[:space:]]*if[[:space:]]*[(]')
+    fi
+    
+    [[ -n "$check_line" ]] || { log_error "Could not find insertion point in do_faccessat"; return 1; }
+    
+    local hook_call="${indent}#ifdef CONFIG_KSU
+${indent}    ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
+${indent}#endif"
+    insert_before_line "$file" "$check_line" "$hook_call"
+    
+    verify_patch_applied "$file" "ksu_handle_faccessat" || { log_error "Patch verification failed for open.c"; return 1; }
+    
+    return 0
+}
+
+# --- Patch: fs/read_write.c ---
+patch_read_write_c() {
+    local file="$1"
+    
+    if verify_patch_applied "$file" "ksu_handle_sys_read"; then
+        log_debug "read_write.c already patched, skipping"
+        return 0
+    fi
+    
+    local backup
+    backup=$(backup_and_verify "$file") || return 1
+    
+    local indent
+    indent=$(detect_indent "$file" 1)
+    
+# Find read syscall - try multiple patterns
+    local read_patterns=(
+        '^[[:space:]]*ssize_t[[:space:]]+ksys_read[[:space:]]*[(]'
+        '^[[:space:]]*long[[:space:]]+ksys_read[[:space:]]*[(]'
+        '^[[:space:]]*SYSCALL_DEFINE3[[:space:]]*[(][[:space:]]*read'
+        '^[[:space:]]*SYSCALL_DEFINE4[[:space:]]*[(][[:space:]]*read'
+        '^[[:space:]]*SYSCALL_DEFINE[[:space:]]*[(][[:space:]]*read'
+        '^[[:space:]]*ssize_t[[:space:]]+vfs_read[[:space:]]*[(]'
+    )
+    local read_line
+    read_line=$(patch_with_fallback "$file" "${read_patterns[@]}")
+    [[ -n "$read_line" ]] || { log_error "Could not find read syscall in $file"; return 1; }
+    
+    # Add extern declarations before the syscall
+    local extern_decl="${indent}#ifdef CONFIG_KSU
+${indent}extern bool ksu_vfs_read_hook __read_mostly;
+${indent}extern __attribute__((cold)) int ksu_handle_sys_read(unsigned int fd,
+${indent}            char __user **buf_ptr, size_t *count_ptr);
+${indent}#endif"
+    insert_before_line "$file" "$read_line" "$extern_decl"
+    
+    # Find fdget/fdget_pos - try multiple patterns
+    local fdget_patterns=(
+        'struct[[:space:]]+fd[[:space:]]+f[[:space:]]*=[[:space:]]*fdget_pos[[:space:]]*[(]'
+        'struct[[:space:]]+fd[[:space:]]+f[[:space:]]*=[[:space:]]*fdget[[:space:]]*[(]'
+        'fd[[:space:]]+f[[:space:]]*=[[:space:]]*fdget_pos[[:space:]]*[(]'
+        'fd[[:space:]]+f[[:space:]]*=[[:space:]]*fdget[[:space:]]*[(]'
+    )
+    local fdget_line
+    for pattern in "${fdget_patterns[@]}"; do
+        fdget_line=$(find_function_end "$file" "$read_line" "$pattern")
+        [[ -n "$fdget_line" ]] && break
+    done
+    [[ -n "$fdget_line" ]] || { log_error "Could not find fdget/fdget_pos in read syscall"; return 1; }
+    
+# Find if (f.file) check - try multiple patterns
+    local if_file_patterns=(
+        'if[[:space:]]*[(][[:space:]]*f\\.file[[:space:]]*[)]'
+        'if[[:space:]]*[(][[:space:]]*f\\.file'
+        'if[[:space:]]*[(][[:space:]]*likely[[:space:]]*[(][[:space:]]*f\\.file[[:space:]]*[)][[[:space:]]*[)]'
+    )
+    local if_file_line
+    for pattern in "${if_file_patterns[@]}"; do
+        if_file_line=$(find_function_end "$file" "$fdget_line" "$pattern")
+        [[ -n "$if_file_line" ]] && break
+    done
+    [[ -n "$if_file_line" ]] || { log_error "Could not find if (f.file) in read syscall"; return 1; }
+    
+    local hook_call="${indent}#ifdef CONFIG_KSU
+${indent}    if (unlikely(ksu_vfs_read_hook))
+${indent}        ksu_handle_sys_read(fd, &buf, &count);
+${indent}#endif"
+    insert_before_line "$file" "$if_file_line" "$hook_call"
+    
+    verify_patch_applied "$file" "ksu_handle_sys_read" || { log_error "Patch verification failed for read_write.c"; return 1; }
+    
+    return 0
+}
+
+# --- Patch: fs/stat.c ---
+patch_stat_c() {
+    local file="$1"
+    
+    if verify_patch_applied "$file" "ksu_handle_stat"; then
+        log_debug "stat.c already patched, skipping"
+        return 0
+    fi
+    
+    local backup
+    backup=$(backup_and_verify "$file") || return 1
+    
+    local indent
+    indent=$(detect_indent "$file" 1)
+    
+    # Find newfstatat syscall - try multiple patterns
+    local fstatat_patterns=(
+        '^[[:space:]]*SYSCALL_DEFINE4[[:space:]]*[(][[:space:]]*newfstatat'
+        '^[[:space:]]*SYSCALL_DEFINE5[[:space:]]*[(][[:space:]]*newfstatat'
+        '^[[:space:]]*SYSCALL_DEFINE[[:space:]]*[(][[:space:]]*newfstatat'
+        '^[[:space:]]*long[[:space:]]+ksys_newfstatat[[:space:]]*[(]'
+        '^[[:space:]]*long[[:space:]]+do_newfstatat[[:space:]]*[(]'
+    )
+    local fstatat_line
+    fstatat_line=$(patch_with_fallback "$file" "${fstatat_patterns[@]}")
+    [[ -n "$fstatat_line" ]] || { log_error "Could not find newfstatat syscall in $file"; return 1; }
+    
+    # Add extern declaration before the syscall
+    local extern_decl="${indent}#ifdef CONFIG_KSU
+${indent}__attribute__((hot))
+${indent}extern int ksu_handle_stat(int *dfd, const char __user **filename_user,
+${indent}            int *flags);
+${indent}#endif"
+    insert_before_line "$file" "$fstatat_line" "$extern_decl"
+    
+    # Find vfs_fstatat call - try multiple patterns
+    local vfs_patterns=(
+        'error[[:space:]]*=[[:space:]]*vfs_fstatat[[:space:]]*[(]'
+        'ret[[:space:]]*=[[:space:]]*vfs_fstatat[[:space:]]*[(]'
+        'vfs_fstatat[[:space:]]*[(]'
+    )
+    local vfs_fstatat_line
+    for pattern in "${vfs_patterns[@]}"; do
+        vfs_fstatat_line=$(find_function_end "$file" "$fstatat_line" "$pattern")
+        [[ -n "$vfs_fstatat_line" ]] && break
+    done
+    [[ -n "$vfs_fstatat_line" ]] || { log_error "Could not find vfs_fstatat call in newfstatat"; return 1; }
+    
+    local hook_call="${indent}#ifdef CONFIG_KSU
+${indent}    ksu_handle_stat(&dfd, &filename, &flag);
+${indent}#endif"
+    insert_before_line "$file" "$vfs_fstatat_line" "$hook_call"
+    
+    verify_patch_applied "$file" "ksu_handle_stat" || { log_error "Patch verification failed for stat.c"; return 1; }
+    
+    return 0
+}
+
+# --- Patch: kernel/reboot.c ---
+patch_reboot_c() {
+    local file="$1"
+    
+    if verify_patch_applied "$file" "ksu_handle_sys_reboot"; then
+        log_debug "reboot.c already patched, skipping"
+        return 0
+    fi
+    
+    local backup
+    backup=$(backup_and_verify "$file") || return 1
+    
+    local indent
+    indent=$(detect_indent "$file" 1)
+    
+    # Find reboot syscall - try multiple patterns
+    local reboot_patterns=(
+        '^[[:space:]]*SYSCALL_DEFINE4[[:space:]]*[(][[:space:]]*reboot'
+        '^[[:space:]]*SYSCALL_DEFINE[[:space:]]*[(][[:space:]]*reboot'
+        '^[[:space:]]*long[[:space:]]+ksys_reboot[[:space:]]*[(]'
+        '^[[:space:]]*asmlinkage[[:space:]]+long[[:space:]]+sys_reboot[[:space:]]*[(]'
+    )
+    local reboot_line
+    reboot_line=$(patch_with_fallback "$file" "${reboot_patterns[@]}")
+    [[ -n "$reboot_line" ]] || { log_error "Could not find reboot syscall in $file"; return 1; }
+    
+    # Add extern declaration before the syscall
+    local extern_decl="${indent}#ifdef CONFIG_KSU
+${indent}extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);
+${indent}#endif"
+    insert_before_line "$file" "$reboot_line" "$extern_decl"
+    
+    # Find pid_namespace declaration - try multiple patterns
+    local pidns_patterns=(
+        'struct[[:space:]]+pid_namespace[[:space:]]*[*][[:space:]]*pid_ns[[:space:]]*=[[:space:]]*task_active_pid_ns'
+        'pid_namespace[[:space:]]*[*][[:space:]]*pid_ns[[:space:]]*=[[:space:]]*task_active_pid_ns'
+        'struct[[:space:]]+pid_namespace[[:space:]]*[*][[:space:]]*pid_ns'
+    )
+    local pidns_line
+    for pattern in "${pidns_patterns[@]}"; do
+        pidns_line=$(find_function_end "$file" "$reboot_line" "$pattern")
+        [[ -n "$pidns_line" ]] && break
+    done
+    
+    # If not found, try finding the first variable declaration after function start
+    if [[ -z "$pidns_line" ]]; then
+        pidns_line=$(find_function_end "$file" "$reboot_line" '^[[:space:]]*[a-zA-Z_][a-zA-Z0-9_]*[[:space:]]+[*]?[[:space:]]*[a-zA-Z_][a-zA-Z0-9_]*[[:space:]]*[=;]')
+    fi
+    
+    [[ -n "$pidns_line" ]] || { log_error "Could not find pid_namespace or insertion point in reboot syscall"; return 1; }
+    
+    local hook_call="${indent}#ifdef CONFIG_KSU
+${indent}    ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
+${indent}#endif"
+    insert_before_line "$file" "$pidns_line" "$hook_call"
+    
+    verify_patch_applied "$file" "ksu_handle_sys_reboot" || { log_error "Patch verification failed for reboot.c"; return 1; }
+    
+    return 0
+}
+
+# ============================================================================
+# Kprobe Method - Config Only
+# ============================================================================
+apply_kprobe_configs() {
+    log_step "Applying kprobe method configurations"
+
+    update_defconfig "${KPROBE_CONFIGS[@]}"
+
+    log_success "Kprobe configurations applied to defconfig"
+    log_info "Note: Verify kprobe works on your kernel. If bootloop occurs, kprobe may be broken."
+    log_info "Test: Comment out ksu_sucompat_init() and ksu_ksud_init() in KernelSU/kernel/ksu.c"
+}
+
+# ============================================================================
+# Verification
+# ============================================================================
+verify_integration() {
+    log_step "Verifying integration"
+
+    # Check KernelSU source exists (KernelSU-Next structure)
+    [[ -d "$KERNEL_SRC/KernelSU-Next" ]] || die "KernelSU-Next directory missing"
+    [[ -f "$KERNEL_SRC/KernelSU-Next/kernel/Kconfig" ]] || die "KernelSU source incomplete - Kconfig missing"
+    [[ -f "$KERNEL_SRC/KernelSU-Next/kernel/core/init.c" ]] || die "KernelSU source incomplete - init.c missing"
+
+    # Check defconfig has CONFIG_KSU
+    grep -q "^CONFIG_KSU=y" "$DEFCONFIG_PATH" || die "CONFIG_KSU not enabled in defconfig"
+
+    if [[ "$METHOD" == "kprobe" ]]; then
+        for config in "${KPROBE_CONFIGS[@]}"; do
+            local key="${config%%=*}"
+            grep -q "^${key}=y" "$DEFCONFIG_PATH" || log_warn "Config not set: $key"
+        done
+    else
+        # Verify patches applied by checking for hook calls
+        local missing_hooks=()
+        grep -q "ksu_handle_execveat" "$KERNEL_SRC/fs/exec.c" || missing_hooks+=("exec.c")
+        grep -q "ksu_handle_faccessat" "$KERNEL_SRC/fs/open.c" || missing_hooks+=("open.c")
+        grep -q "ksu_handle_sys_read" "$KERNEL_SRC/fs/read_write.c" || missing_hooks+=("read_write.c")
+        grep -q "ksu_handle_stat" "$KERNEL_SRC/fs/stat.c" || missing_hooks+=("stat.c")
+        grep -q "ksu_handle_sys_reboot" "$KERNEL_SRC/kernel/reboot.c" || missing_hooks+=("reboot.c")
+
+        if [[ ${#missing_hooks[@]} -gt 0 ]]; then
+            die "Manual patches incomplete. Missing hooks in: ${missing_hooks[*]}"
+        fi
+    fi
+
+    log_success "Integration verified successfully"
+}
+
+# ============================================================================
+# Main
+# ============================================================================
+main() {
+    validate_args "$@"
+    check_prerequisites
+    
+    log_info "KernelSU Next Legacy Integration Script v$SCRIPT_VERSION"
+    log_info "Method: $METHOD | Kernel: $KERNEL_SRC | Defconfig: $DEFCONFIG_PATH"
+    
+    # Pre-flight detection of existing KSU integration
+    detect_existing_ksu
+
+    fetch_ksu_source
+
+    case "$METHOD" in
+        kprobe)
+            apply_kprobe_configs
+            ;;
+        manual)
+            # Disable kprobe-specific configs when switching to manual method
+            # Per docs: manual method only needs CONFIG_KSU=y
+            log_step "Disabling kprobe-specific configs for manual method"
+            update_defconfig "CONFIG_KSU_KPROBE_HOOKS=n" "CONFIG_KPROBES=n" "CONFIG_KPROBE_EVENTS=n"
+            update_defconfig "$MANUAL_CONFIG"
+            apply_manual_patches
+            ;;
+    esac
+
+    verify_integration
+
+    log_step "Integration Complete"
+    log_success "KernelSU Next (legacy) integrated using '$METHOD' method"
+    log_info "Next steps:"
+    log_info "  1. Build your kernel: make -C $KERNEL_SRC $(basename "$DEFCONFIG_PATH") && make -C $KERNEL_SRC"
+    log_info "  2. Flash the resulting boot.img"
+    log_info "  3. If using kprobe and bootloops: kprobe is broken, use 'manual' method instead"
+
+    if [[ "$METHOD" == "manual" ]]; then
+        log_info "  Backup files created: *.ksun-backup.* in each patched directory"
+    fi
+}
+
+# Handle script arguments
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    if [[ $# -eq 0 || "$1" == "-h" || "$1" == "--help" ]]; then
+        show_usage
+        exit 0
+    fi
+    main "$@"
+fi

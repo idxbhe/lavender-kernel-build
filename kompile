@@ -1,0 +1,389 @@
+#!/bin/bash
+set -euo pipefail
+
+SCRIPT_NAME="kompile"
+BASE_DIR="/home/bhe/lavender"
+TOOLCHAINS_BASE_DIR="$BASE_DIR/toolchains"
+
+usage() {
+    cat <<EOF
+Usage: $SCRIPT_NAME [toolchain] [kernel source dir] [defconfig] [options]
+
+Toolchains:
+  san-gcc   - SAN-GCC (GCC-based cross-compiler)
+  neutron   - Neutron Clang (LLVM-based)
+  azure     - Azure Clang (LLVM-based)
+  proton    - Proton Clang (LLVM-based)
+
+Arguments:
+  toolchain         Required. One of: san-gcc, neutron, azure, proton
+  kernel source dir Required. Path to kernel source directory
+  defconfig         Optional. Defconfig name (relative to arch/arm64/configs/).
+                    Required unless --continue is used.
+
+Options:
+  --continue, --resume   Skip kernel configuration (resume previous build)
+  --clean                Remove output directory before building (conflicts with --continue)
+  --out, -O <dir>        Output directory (default: out). Conflicts with --continue.
+  --frag <config>        Merge fragment config (relative to arch/arm64/configs/).
+                         Only works without --continue.
+
+Examples:
+  $SCRIPT_NAME san-gcc ./sajad-kernel lavender_defconfig
+  $SCRIPT_NAME neutron ./scarlet-kernel vendor/lavender-perf_defconfig --clean
+  $SCRIPT_NAME azure ./sajad-kernel lavender_defconfig --out build-out
+  $SCRIPT_NAME proton ./sajad-kernel --continue
+  $SCRIPT_NAME neutron ./kernel main_defconfig --frag vendor/special.config
+EOF
+    exit 1
+}
+
+log() {
+    echo "[$SCRIPT_NAME] $*"
+}
+
+error() {
+    echo "[$SCRIPT_NAME] ERROR: $*" >&2
+    exit 1
+}
+
+warn() {
+    echo "[$SCRIPT_NAME] WARNING: $*" >&2
+}
+
+# Parse arguments
+TOOLCHAIN=""
+KERNEL_DIR=""
+DEFCONFIG=""
+FRAGMENT=""
+CONTINUE_BUILD=false
+CLEAN_BUILD=false
+OUT_DIR="out"
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --continue|--resume)
+            CONTINUE_BUILD=true
+            shift
+            ;;
+        --clean)
+            CLEAN_BUILD=true
+            shift
+            ;;
+        --out|-O)
+            if [[ -z ${2:-} ]]; then
+                error "--out/-O requires a directory argument"
+            fi
+            OUT_DIR="$2"
+            shift 2
+            ;;
+        --frag)
+            if [[ -z ${2:-} ]]; then
+                error "--frag requires a fragment config argument"
+            fi
+            FRAGMENT="$2"
+            shift 2
+            ;;
+        --help|-h)
+            usage
+            ;;
+        -*)
+            error "Unknown option: $1"
+            ;;
+        *)
+            if [[ -z $TOOLCHAIN ]]; then
+                TOOLCHAIN="$1"
+            elif [[ -z $KERNEL_DIR ]]; then
+                KERNEL_DIR="$1"
+            elif [[ -z $DEFCONFIG && $CONTINUE_BUILD == false ]]; then
+                DEFCONFIG="$1"
+            else
+                error "Too many positional arguments: $1"
+            fi
+            shift
+            ;;
+    esac
+done
+
+# Validate required arguments
+[[ -z $TOOLCHAIN ]] && error "Toolchain is required. Use --help for usage."
+[[ -z $KERNEL_DIR ]] && error "Kernel source directory is required."
+
+# Validate toolchain early
+VALID_TOOLCHAINS="san-gcc neutron azure proton"
+if [[ ! " $VALID_TOOLCHAINS " =~ " $TOOLCHAIN " ]]; then
+    error "Invalid toolchain: $TOOLCHAIN. Valid options: $VALID_TOOLCHAINS"
+fi
+
+# Validate flag conflicts
+if [[ $CONTINUE_BUILD == true && $CLEAN_BUILD == true ]]; then
+    error "--continue and --clean cannot be used together"
+fi
+if [[ $CONTINUE_BUILD == true && $OUT_DIR != "out" ]]; then
+    error "--continue and --out/-O cannot be used together"
+fi
+if [[ $CONTINUE_BUILD == true && -n $FRAGMENT ]]; then
+    error "--continue and --frag cannot be used together"
+fi
+if [[ $CONTINUE_BUILD == false && -z $DEFCONFIG ]]; then
+    error "Defconfig is required unless --continue is used"
+fi
+
+# Toolchain configurations
+declare -A TOOLCHAIN_CONFIGS=(
+    [san-gcc]="GCC"
+    [neutron]="CLANG"
+    [azure]="CLANG"
+    [proton]="CLANG"
+)
+
+declare -A TOOLCHAIN_DIRS=(
+    [san-gcc]="$TOOLCHAINS_BASE_DIR/san-gcc/bin"
+    [neutron]="$TOOLCHAINS_BASE_DIR/neutron-clang/bin"
+    [azure]="$TOOLCHAINS_BASE_DIR/azure-clang/bin"
+    [proton]="$TOOLCHAINS_BASE_DIR/proton-clang/bin"
+)
+
+declare -A DEFAULT_DEFCONFIGS=(
+    [san-gcc]="lavender_defconfig"
+    [neutron]="vendor/lavender-perf_defconfig"
+    [azure]="lavender_defconfig"
+    [proton]="lavender_defconfig"
+)
+
+TOOLCHAIN_TYPE="${TOOLCHAIN_CONFIGS[$TOOLCHAIN]}"
+TOOLCHAIN_DIR="${TOOLCHAIN_DIRS[$TOOLCHAIN]}"
+
+# Validate kernel directory exists
+if [[ ! -d "$KERNEL_DIR" ]]; then
+    error "Kernel source directory not found: $KERNEL_DIR"
+fi
+
+# Resolve kernel directory to absolute path
+KERNEL_DIR="$(cd "$KERNEL_DIR" && pwd)"
+
+# Use default defconfig if not provided and not continuing
+if [[ $CONTINUE_BUILD == false && -z $DEFCONFIG ]]; then
+    DEFCONFIG="${DEFAULT_DEFCONFIGS[$TOOLCHAIN]}"
+    log "Using default defconfig for $TOOLCHAIN: $DEFCONFIG"
+fi
+
+log "Host architecture: $(uname -m)"
+log "CPU cores: $(nproc)"
+log "Toolchain: $TOOLCHAIN ($TOOLCHAIN_TYPE)"
+log "Kernel source: $KERNEL_DIR"
+[[ $CONTINUE_BUILD == false ]] && log "Defconfig: $DEFCONFIG"
+log "Output directory: $OUT_DIR"
+echo ""
+
+# Validate toolchain directory
+if [[ ! -d "$TOOLCHAIN_DIR" ]]; then
+    error "Toolchain directory not found: $TOOLCHAIN_DIR"
+fi
+
+# Validate kernel directory
+if [[ ! -d "$KERNEL_DIR" ]]; then
+    error "Kernel source directory not found: $KERNEL_DIR"
+fi
+
+cd "$KERNEL_DIR"
+
+# Validate defconfig if not continuing
+if [[ $CONTINUE_BUILD == false ]]; then
+    if [[ ! -f "arch/arm64/configs/$DEFCONFIG" ]]; then
+        error "Defconfig not found: arch/arm64/configs/$DEFCONFIG"
+    fi
+    # Validate fragment if provided
+    if [[ -n $FRAGMENT ]]; then
+        if [[ ! -f "arch/arm64/configs/$FRAGMENT" ]]; then
+            error "Fragment config not found: arch/arm64/configs/$FRAGMENT"
+        fi
+        log "Fragment config: $FRAGMENT"
+    fi
+fi
+
+# Toolchain-specific validation and setup
+case $TOOLCHAIN in
+    san-gcc)
+        if [[ ! -f "$TOOLCHAIN_DIR/aarch64-linux-gcc" ]]; then
+            error "SAN-GCC toolchain not found: $TOOLCHAIN_DIR/aarch64-linux-gcc"
+        fi
+        if [[ ! -f "$TOOLCHAIN_DIR/arm-linux-gnueabi-gcc" ]]; then
+            error "ARM32 compat toolchain not found: $TOOLCHAIN_DIR/arm-linux-gnueabi-gcc"
+        fi
+        export PATH="$TOOLCHAIN_DIR:$PATH"
+        log "Toolchain version:"
+        aarch64-linux-gcc --version | head -1
+        ;;
+    neutron|azure|proton)
+        if [[ ! -f "$TOOLCHAIN_DIR/clang" ]]; then
+            error "Clang not found in toolchain: $TOOLCHAIN_DIR/clang"
+        fi
+        
+        # Common LLVM tools required
+        for tool in clang llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-strip lld; do
+            if [[ ! -f "$TOOLCHAIN_DIR/$tool" && ! -L "$TOOLCHAIN_DIR/$tool" ]]; then
+                error "Required tool '$tool' not found in $TOOLCHAIN_DIR"
+            fi
+        done
+        
+        # Azure and Proton require additional cross-compile binutils
+        if [[ $TOOLCHAIN == "azure" || $TOOLCHAIN == "proton" ]]; then
+            for tool in aarch64-linux-gnu-ld aarch64-linux-gnu-as arm-linux-gnueabi-ld arm-linux-gnueabi-as; do
+                if [[ ! -f "$TOOLCHAIN_DIR/$tool" && ! -L "$TOOLCHAIN_DIR/$tool" ]]; then
+                    error "Required tool '$tool' not found in $TOOLCHAIN_DIR"
+                fi
+            done
+        fi
+        
+        export PATH="$TOOLCHAIN_DIR:$PATH"
+        log "Toolchain version:"
+        clang --version | head -1
+        ;;
+esac
+
+echo ""
+
+# Check build dependencies
+log "Checking build dependencies..."
+DEPS_MISSING=0
+for dep in cpio flex bison bc gcc make; do
+    if ! command -v "$dep" >/dev/null 2>&1; then
+        warn "$dep missing"
+        DEPS_MISSING=1
+    else
+        log "  OK: $dep ($(command -v "$dep"))"
+    fi
+done
+
+if [[ $DEPS_MISSING -eq 1 ]]; then
+    echo ""
+    warn "Some dependencies are missing. Build may fail."
+    echo "Install missing packages:"
+    echo "  Ubuntu/Debian: sudo apt install cpio flex bison bc build-essential"
+    echo "  Fedora: sudo dnf install cpio flex bison bc gcc make"
+    echo ""
+fi
+
+# Handle clean build
+if [[ $CLEAN_BUILD == true ]]; then
+    log "Cleaning output directory: $OUT_DIR"
+    rm -rf "$OUT_DIR"
+fi
+
+JOBS=$(( $(nproc) - 1 ))
+[[ $JOBS -lt 1 ]] && JOBS=1
+
+# Build configuration
+MAKE_ARGS=(
+    -j"$JOBS"
+    ARCH=arm64
+    O="$OUT_DIR"
+)
+
+case $TOOLCHAIN in
+    san-gcc)
+        MAKE_ARGS+=(
+            CC=aarch64-linux-gcc
+            CROSS_COMPILE=aarch64-linux-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+        )
+        ;;
+    neutron)
+        MAKE_ARGS+=(
+            CC=clang
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+            LLVM=1
+            LLVM_IAS=1
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            STRIP=llvm-strip
+        )
+        ;;
+    azure)
+        MAKE_ARGS+=(
+            CC=clang
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+            LLVM=1
+            LLVM_IAS=1
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            STRIP=llvm-strip
+        )
+        ;;
+    proton)
+        MAKE_ARGS+=(
+            CC=clang
+            HOSTCC=gcc
+            HOSTCXX=g++
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            STRIP=llvm-strip
+        )
+        ;;
+esac
+
+log "Starting build..."
+echo "  ARCH=arm64"
+for arg in "${MAKE_ARGS[@]}"; do
+    [[ $arg == *=* ]] && echo "  $arg"
+done
+[[ $CONTINUE_BUILD == false ]] && echo "  DEFCONFIG=$DEFCONFIG"
+[[ -n $FRAGMENT ]] && echo "  FRAGMENT=$FRAGMENT"
+echo "  OUTPUT_DIR=$OUT_DIR"
+echo "  JOBS=$JOBS"
+echo ""
+
+# Configure kernel if not continuing
+if [[ $CONTINUE_BUILD == false ]]; then
+    log "Configuring kernel..."
+    make "${MAKE_ARGS[@]}" "$DEFCONFIG"
+    
+    # Merge fragment if provided
+    if [[ -n $FRAGMENT ]]; then
+        log "Merging fragment config: $FRAGMENT"
+        scripts/kconfig/merge_config.sh -m -r -O "$OUT_DIR" "$OUT_DIR/.config" "arch/arm64/configs/$FRAGMENT"
+        make "${MAKE_ARGS[@]}" olddefconfig
+    fi
+    echo ""
+fi
+
+# Build kernel
+log "Building kernel image..."
+make "${MAKE_ARGS[@]}"
+
+echo ""
+log "Build completed successfully."
+log "Output directory: $KERNEL_DIR/$OUT_DIR"
+log "Kernel Image: $KERNEL_DIR/$OUT_DIR/arch/arm64/boot/Image"
+log "Compressed: $KERNEL_DIR/$OUT_DIR/arch/arm64/boot/Image.gz"
+log "Device Tree Blobs: $KERNEL_DIR/$OUT_DIR/arch/arm64/boot/dts/vendor/qcom/xiaomi/"
+echo ""
+
+# Show output files
+for file in \
+    "$OUT_DIR/arch/arm64/boot/Image" \
+    "$OUT_DIR/arch/arm64/boot/Image.gz" \
+    "$OUT_DIR/System.map" \
+    "$OUT_DIR/vmlinux"
+do
+    if [[ -f "$file" ]]; then
+        ls -lh "$file"
+    fi
+done
+
+echo ""
+log "Next steps:"
+echo "  1. Copy Image.gz-dtb to AnyKernel3/"
+echo "  2. Run build-flashable-zip.sh to create flashable zip"
+echo "  3. Flash via TWRP/OrangeFox recovery"
