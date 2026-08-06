@@ -24,6 +24,7 @@ readonly KSU_KERNEL_SOURCE="$KSU_SUBMODULE_PATH/kernel"
 
 # Options
 SKIP_KSU_FETCH=0
+BACKPORT_PATH_UMOUNT=0
 
 # Required kernel configs for kprobe method
 readonly KPROBE_CONFIGS=(
@@ -47,6 +48,11 @@ readonly MANUAL_PATCH_FILES=(
     "fs/stat.c"
     "kernel/reboot.c"
 )
+
+# Optional: path_umount backport from KernelSU original (for pre-5.9 kernels)
+# Required for "Umount module" feature on pre-GKI kernels.
+readonly BACKPORT_PATH_UMOUNT_FILE="fs/namespace.c"
+readonly BACKPORT_PATH_UMOUNT_HOOK="path_umount"
 
 # ============================================================================
 # Logging & Output Functions
@@ -193,7 +199,10 @@ Arguments:
   defconfig_path    Defconfig filename (relative to kernel_source/arch/arm64/configs/ or absolute)
 
 Options:
-  --skip-ksu-fetch  Skip fetching/updating KernelSU Next submodule (use existing)
+  --skip-ksu-fetch          Skip fetching/updating KernelSU Next submodule (use existing)
+  --backport-path_umount    Backport path_umount from kernel 5.9 (KernelSU original)
+                            Fixes "Umount module" feature on pre-5.9 / pre-GKI kernels
+                            Only valid with 'manual' method (ignored for kprobe)
 
 Methods:
   kprobe   - Uses kprobe hooks (recommended if kprobe works on your kernel)
@@ -209,11 +218,13 @@ Examples:
   $SCRIPT_NAME kprobe /path/to/kernel vendor/lavender_defconfig
   $SCRIPT_NAME manual /path/to/kernel lavender_defconfig
   $SCRIPT_NAME --skip-ksu-fetch manual /path/to/kernel vendor/lavender-perf_defconfig
+  $SCRIPT_NAME --backport-path_umount manual /path/to/kernel lavender_defconfig
 
 Notes:
   - Kernel source must be buildable (bootable kernel from source)
   - For manual method: patches 5 kernel files with KSU hooks
   - For kprobe method: enables required kprobe configs in defconfig
+  - --backport-path_umount adds an extra patch to fs/namespace.c (manual only)
   - Run from kernel source root or provide absolute paths
 EOF
 }
@@ -226,6 +237,7 @@ validate_args() {
     for arg in "$@"; do
         case "$arg" in
             --skip-ksu-fetch) SKIP_KSU_FETCH=1 ;;
+            --backport-path_umount) BACKPORT_PATH_UMOUNT=1 ;;
             *) args+=("$arg") ;;
         esac
     done
@@ -256,6 +268,13 @@ validate_args() {
     log_debug "Kernel source: $KERNEL_SRC"
     log_debug "Defconfig: $DEFCONFIG_PATH"
     log_debug "Skip KSU fetch: $SKIP_KSU_FETCH"
+    log_debug "Backport path_umount: $BACKPORT_PATH_UMOUNT"
+
+    # Validate flag-method compatibility
+    if [[ $BACKPORT_PATH_UMOUNT -eq 1 && "$METHOD" != "manual" ]]; then
+        log_warn "--backport-path_umount only applies to 'manual' method; ignoring flag"
+        BACKPORT_PATH_UMOUNT=0
+    fi
 }
 
 # ============================================================================
@@ -1027,6 +1046,143 @@ ${indent}#endif"
     return 0
 }
 
+# --- Patch: fs/namespace.c (path_umount backport from kernel 5.9) ---
+# Reference: KernelSU original documentation
+# Required for "Umount module" feature on kernels older than 5.9
+patch_namespace_c() {
+    local file="$1"
+
+    # Verify patch not already applied
+    if verify_patch_applied "$file" "$BACKPORT_PATH_UMOUNT_HOOK"; then
+        log_debug "namespace.c already has $BACKPORT_PATH_UMOUNT_HOOK, skipping"
+        return 0
+    fi
+
+    local backup
+    backup=$(backup_and_verify "$file") || return 1
+
+    local indent
+    indent=$(detect_indent "$file" 1)
+
+    # Find insertion anchor: 'may_mandlock' function end (closing brace).
+    # The official patch places path_umount right after may_mandlock's
+    # '#endif' line, before the "Now umount can handle mount points" comment.
+    #
+    # Strategy:
+    #   1. Find 'may_mandlock' function start
+    #   2. Find the 'endif' line that closes the #if around may_mandlock
+    #   3. Insert the path_umount block right after that endif
+    #   Fallback: insert before the "Now umount" comment block
+    #
+    # Note: We use awk directly (not patch_with_fallback) because
+    # may_mandlock is optional - its absence should trigger the fallback,
+    # not abort the script (set -e would abort on patch_with_fallback rc=1).
+
+    local may_mandlock_line
+    may_mandlock_line=$(awk '
+        /may_mandlock/ { print NR; exit }
+    ' "$file")
+
+    local insert_line=""
+
+    if [[ -n "$may_mandlock_line" ]]; then
+        # Find the first '#endif' after may_mandlock (closing its #if guard)
+        local endif_line
+        endif_line=$(awk -v start="$may_mandlock_line" '
+            NR > start && /^[[:space:]]*#endif/ { print NR; exit }
+        ' "$file")
+        if [[ -n "$endif_line" ]]; then
+            insert_line=$((endif_line + 1))
+        fi
+    fi
+
+    # Fallback: find the "Now umount" comment block and insert before it
+    if [[ -z "$insert_line" ]]; then
+        local now_umount_line
+        now_umount_line=$(awk '
+            /Now umount can handle mount points/ { print NR; exit }
+        ' "$file")
+        if [[ -n "$now_umount_line" ]]; then
+            insert_line="$now_umount_line"
+        fi
+    fi
+
+    # Last-resort fallback: append to end of file
+    if [[ -z "$insert_line" ]]; then
+        log_warn "Could not find may_mandlock anchor in namespace.c; appending path_umount at end of file"
+        insert_line=$(wc -l < "$file")
+        insert_line=$((insert_line + 1))
+    fi
+
+    # The path_umount backport block (verbatim from KernelSU original docs)
+    local backport_block="${indent}#ifdef CONFIG_KSU
+${indent}static int can_umount(const struct path *path, int flags)
+${indent}{
+${indent}       struct mount *mnt = real_mount(path->mnt);
+${indent}
+${indent}       if (flags & ~(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW))
+${indent}               return -EINVAL;
+${indent}       if (!may_mount())
+${indent}               return -EPERM;
+${indent}       if (path->dentry != path->mnt->mnt_root)
+${indent}               return -EINVAL;
+${indent}       if (!check_mnt(mnt))
+${indent}               return -EINVAL;
+${indent}       if (mnt->mnt.mnt_flags & MNT_LOCKED) /* Check optimistically */
+${indent}               return -EINVAL;
+${indent}       if (flags & MNT_FORCE && !capable(CAP_SYS_ADMIN))
+${indent}               return -EPERM;
+${indent}       return 0;
+${indent}}
+${indent}
+${indent}int path_umount(struct path *path, int flags)
+${indent}{
+${indent}       struct mount *mnt = real_mount(path->mnt);
+${indent}       int ret;
+${indent}
+${indent}       ret = can_umount(path, flags);
+${indent}       if (!ret)
+${indent}               ret = do_umount(mnt, flags);
+${indent}
+${indent}       /* we mustn't call path_put() as that would clear mnt_expiry_mark */
+${indent}       dput(path->dentry);
+${indent}       mntput_no_expire(mnt);
+${indent}       return ret;
+${indent}}
+${indent}#endif"
+
+    insert_before_line "$file" "$insert_line" "$backport_block"
+
+    verify_patch_applied "$file" "$BACKPORT_PATH_UMOUNT_HOOK" \
+        || { log_error "Patch verification failed for namespace.c (path_umount)"; return 1; }
+
+    return 0
+}
+
+# Apply path_umount backport (optional, only when --backport-path_umount is set)
+apply_path_umount_backport() {
+    log_step "Applying path_umount backport (KernelSU original, for pre-5.9 kernels)"
+
+    local filepath="$KERNEL_SRC/$BACKPORT_PATH_UMOUNT_FILE"
+
+    if [[ ! -f "$filepath" ]]; then
+        log_error "File not found: $filepath"
+        log_error "Cannot apply path_umount backport"
+        return 1
+    fi
+
+    log_info "Patching $BACKPORT_PATH_UMOUNT_FILE..."
+
+    if patch_namespace_c "$filepath"; then
+        log_success "Patched $BACKPORT_PATH_UMOUNT_FILE (path_umount backport applied)"
+    else
+        log_error "Failed to patch $BACKPORT_PATH_UMOUNT_FILE"
+        return 1
+    fi
+
+    return 0
+}
+
 # ============================================================================
 # Kprobe Method - Config Only
 # ============================================================================
@@ -1083,6 +1239,13 @@ verify_integration() {
             die "Manual patches incomplete. Missing hooks in: ${missing_hooks[*]}"
         fi
 
+        # Verify optional path_umount backport if flag was set
+        if [[ $BACKPORT_PATH_UMOUNT -eq 1 ]]; then
+            grep -q "$BACKPORT_PATH_UMOUNT_HOOK" "$KERNEL_SRC/$BACKPORT_PATH_UMOUNT_FILE" \
+                || die "path_umount backport not found in $BACKPORT_PATH_UMOUNT_FILE"
+            log_success "path_umount backport verified in $BACKPORT_PATH_UMOUNT_FILE"
+        fi
+
         # Verify manual method configs
         grep -q "^CONFIG_KSU_MANUAL_HOOK=y" "$DEFCONFIG_PATH" || log_warn "Config not set: CONFIG_KSU_MANUAL_HOOK"
     fi
@@ -1116,6 +1279,11 @@ main() {
             update_defconfig "CONFIG_KSU_KPROBE_HOOKS=n" "CONFIG_KPROBES=n" "CONFIG_KPROBE_EVENTS=n"
             update_defconfig "${MANUAL_CONFIGS[@]}"
             apply_manual_patches
+
+            # Optional: backport path_umount from KernelSU original (pre-5.9 kernels)
+            if [[ $BACKPORT_PATH_UMOUNT -eq 1 ]]; then
+                apply_path_umount_backport || die "path_umount backport failed"
+            fi
             ;;
     esac
 
@@ -1130,6 +1298,10 @@ main() {
 
     if [[ "$METHOD" == "manual" ]]; then
         log_info "  Backup files created: *.ksun-backup.* in each patched directory"
+        if [[ $BACKPORT_PATH_UMOUNT -eq 1 ]]; then
+            log_info "  path_umount backport applied to fs/namespace.c (KernelSU original)"
+            log_info "  This enables 'Umount module' feature on pre-5.9 / pre-GKI kernels"
+        fi
     fi
 }
 
