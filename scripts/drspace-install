@@ -2,15 +2,17 @@
 """
 drspace-install — Install Droidspaces OSS kernel configurations.
 Usage:
-    ./drspace-install <kernel_source_path> <defconfig_path> [--include-optional] [--skip-patch]
+    ./drspace-install <kernel_source_path> <defconfig_rel_path> [--include-optional] [--skip-patch] [--dry-run]
 
 Arguments:
     kernel_source_path : path to kernel source tree (contains Makefile)
-    defconfig_path     : path to defconfig (e.g. arch/arm64/configs/vendor/lavender-perf_defconfig)
+    defconfig_rel_path : path to defconfig relative to <kernel_source>/arch/arm64/configs
+                         (e.g. vendor/lavender-perf_defconfig)
 
 Flags:
     --include-optional  : include optional configurations (UFW/Fail2ban, USER_NS, TMPFS_XATTR, etc.)
     --skip-patch        : skip patching step, only configure defconfig
+    --dry-run           : show what would be done without making changes
 """
 
 import argparse
@@ -519,7 +521,7 @@ def main():
         formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument("kernel_source", type=str, help="Path to kernel source directory (contains Makefile)")
-    parser.add_argument("defconfig_path", type=str, help="Path to defconfig file (e.g. arch/arm64/configs/vendor/whyred-perf_defconfig)")
+    parser.add_argument("defconfig_path", type=str, help="Path to defconfig file relative to <kernel_source>/arch/arm64/configs (e.g. vendor/whyred-perf_defconfig)")
     parser.add_argument("--include-optional", action="store_true", help="Include optional configurations (UFW, Fail2ban, USER_NS, TMPFS_XATTR, TMPFS_POSIX_ACL, etc.)")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be done without making changes.")
     parser.add_argument("--skip-patch", action="store_true", help="Skip patching step, only configure defconfig.")
@@ -527,7 +529,10 @@ def main():
 
     # Validate paths
     src_path = Path(args.kernel_source)
-    defconfig_path = Path(args.defconfig_path)
+    
+    # Resolve defconfig_path relative to <kernel_source>/arch/arm64/configs
+    defconfig_base = src_path / "arch" / "arm64" / "configs"
+    defconfig_path = defconfig_base / args.defconfig_path
 
     if not src_path.is_dir():
         print(f"[ERROR] Kernel source directory does not exist: {src_path}", file=sys.stderr)

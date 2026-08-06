@@ -20,3 +20,5 @@ san_scripts/
 crdroid/
 kernels/
 *-dtb
+__pycache__
+boots/

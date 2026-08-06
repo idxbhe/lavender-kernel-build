@@ -33,8 +33,11 @@ readonly KPROBE_CONFIGS=(
     "CONFIG_KSU=y"
 )
 
-# Required kernel config for manual method
-readonly MANUAL_CONFIG="CONFIG_KSU=y"
+# Required kernel configs for manual method
+readonly MANUAL_CONFIGS=(
+    "CONFIG_KSU=y"
+    "CONFIG_KSU_MANUAL_HOOK=y"
+)
 
 # Files to patch for manual integration (relative to kernel source root)
 readonly MANUAL_PATCH_FILES=(
@@ -561,10 +564,10 @@ update_defconfig() {
 
     # Also ensure CONFIG_KSU is set for both methods
     if ! grep -q "^CONFIG_KSU=" "$DEFCONFIG_PATH" && ! grep -q "^# CONFIG_KSU is not set" "$DEFCONFIG_PATH"; then
-        echo "$MANUAL_CONFIG" >> "$DEFCONFIG_PATH"
+        echo "CONFIG_KSU=y" >> "$DEFCONFIG_PATH"
         modified=1
     elif grep -q "^# CONFIG_KSU is not set" "$DEFCONFIG_PATH"; then
-        sed -i "s|^# CONFIG_KSU is not set|$MANUAL_CONFIG|" "$DEFCONFIG_PATH"
+        sed -i "s|^# CONFIG_KSU is not set|CONFIG_KSU=y|" "$DEFCONFIG_PATH"
         modified=1
     fi
 
@@ -961,12 +964,27 @@ patch_reboot_c() {
     reboot_line=$(patch_with_fallback "$file" "${reboot_patterns[@]}")
     [[ -n "$reboot_line" ]] || { log_error "Could not find reboot syscall in $file"; return 1; }
     
-    # Add extern declaration before the syscall
-    local extern_decl="${indent}#ifdef CONFIG_KSU
-${indent}extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);
-${indent}#endif"
-    insert_before_line "$file" "$reboot_line" "$extern_decl"
-    
+# Find the opening brace of the function
+    local brace_line
+    brace_line=$(find_function_end "$file" "$reboot_line" '^[[:space:]]*{')
+    [[ -n "$brace_line" ]] || { log_error "Could not find opening brace of reboot syscall"; return 1; }
+
+    # Detect indentation from the function body
+    indent=$(detect_indent "$file" "$((brace_line + 1))")
+
+    # Find the first executable statement (non-declaration) after opening brace
+    local first_exec_line
+    first_exec_line=$(awk -v start="$brace_line" '
+        NR > start && /^[[:space:]]*(struct|union|enum|int|char|short|long|float|double|void|size_t|pid_t|uid_t|gid_t|mode_t|dev_t|ino_t|off_t|time_t|clock_t|ssize_t|ptrdiff_t|uintptr_t|intptr_t|int8_t|int16_t|int32_t|int64_t|uint8_t|uint16_t|uint32_t|uint64_t|bool)[[:space:]]+/ { next }
+        NR > start && /^[[:space:]]*(const|static|volatile|inline|extern|register|unsigned|signed)[[:space:]]+/ { next }
+        NR > start && /^[[:space:]]*#/ { next }
+        NR > start && /^[[:space:]]*$/ { next }
+        NR > start && /^[[:space:]]*\/\// { next }
+        NR > start && /^[[:space:]]*\/\*/ { next }
+        NR > start && /^[[:space:]]*\*{1,2}/ { next }
+        NR > start { print NR; exit }
+    ' "$file")
+
     # Find pid_namespace declaration - try multiple patterns
     local pidns_patterns=(
         'struct[[:space:]]+pid_namespace[[:space:]]*[*][[:space:]]*pid_ns[[:space:]]*=[[:space:]]*task_active_pid_ns'
@@ -975,24 +993,37 @@ ${indent}#endif"
     )
     local pidns_line
     for pattern in "${pidns_patterns[@]}"; do
-        pidns_line=$(find_function_end "$file" "$reboot_line" "$pattern")
+        pidns_line=$(find_function_end "$file" "$brace_line" "$pattern")
         [[ -n "$pidns_line" ]] && break
     done
-    
+
     # If not found, try finding the first variable declaration after function start
     if [[ -z "$pidns_line" ]]; then
-        pidns_line=$(find_function_end "$file" "$reboot_line" '^[[:space:]]*[a-zA-Z_][a-zA-Z0-9_]*[[:space:]]+[*]?[[:space:]]*[a-zA-Z_][a-zA-Z0-9_]*[[:space:]]*[=;]')
+        pidns_line=$(find_function_end "$file" "$brace_line" '^[[:space:]]*[a-zA-Z_][a-zA-Z0-9_]*[[:space:]]+[*]?[[:space:]]*[a-zA-Z_][a-zA-Z0-9_]*[[:space:]]*[=;]')
     fi
-    
+
     [[ -n "$pidns_line" ]] || { log_error "Could not find pid_namespace or insertion point in reboot syscall"; return 1; }
-    
+
+    # Fallback: if we can't find an executable line, insert after pidns_line
+    if [[ -z "$first_exec_line" ]]; then
+        first_exec_line=$((pidns_line + 1))
+    fi
+
+    # Add extern declaration right after the opening brace
+    local extern_decl="${indent}#ifdef CONFIG_KSU
+${indent}extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);
+${indent}#endif"
+    insert_before_line "$file" "$((brace_line + 1))" "$extern_decl"
+
+    # The extern declaration adds 4 lines, so adjust first_exec_line
+    first_exec_line=$((first_exec_line + 4))
+
     local hook_call="${indent}#ifdef CONFIG_KSU
 ${indent}    ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
 ${indent}#endif"
-    insert_before_line "$file" "$pidns_line" "$hook_call"
-    
+    insert_before_line "$file" "$first_exec_line" "$hook_call"
+
     verify_patch_applied "$file" "ksu_handle_sys_reboot" || { log_error "Patch verification failed for reboot.c"; return 1; }
-    
     return 0
 }
 
@@ -1051,6 +1082,9 @@ verify_integration() {
         if [[ ${#missing_hooks[@]} -gt 0 ]]; then
             die "Manual patches incomplete. Missing hooks in: ${missing_hooks[*]}"
         fi
+
+        # Verify manual method configs
+        grep -q "^CONFIG_KSU_MANUAL_HOOK=y" "$DEFCONFIG_PATH" || log_warn "Config not set: CONFIG_KSU_MANUAL_HOOK"
     fi
 
     log_success "Integration verified successfully"
@@ -1080,7 +1114,7 @@ main() {
             # Per docs: manual method only needs CONFIG_KSU=y
             log_step "Disabling kprobe-specific configs for manual method"
             update_defconfig "CONFIG_KSU_KPROBE_HOOKS=n" "CONFIG_KPROBES=n" "CONFIG_KPROBE_EVENTS=n"
-            update_defconfig "$MANUAL_CONFIG"
+            update_defconfig "${MANUAL_CONFIGS[@]}"
             apply_manual_patches
             ;;
     esac
