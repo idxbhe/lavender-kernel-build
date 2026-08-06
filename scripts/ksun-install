@@ -189,7 +189,7 @@ backup_and_verify() {
 # ============================================================================
 show_usage() {
     cat <<EOF
-Usage: $SCRIPT_NAME [options] <method> <kernel_source_dir> <defconfig_path>
+Usage: $SCRIPT_NAME [options] <method> <kernel_source_dir> [defconfig_path]
 
 Integrate KernelSU Next (legacy/non-GKI) into a kernel source tree.
 
@@ -197,12 +197,14 @@ Arguments:
   method            Integration method: 'manual' or 'kprobe'
   kernel_source_dir Path to kernel source tree (must exist and be writable)
   defconfig_path    Defconfig filename (relative to kernel_source/arch/arm64/configs/ or absolute)
+                    Optional when --backport-path_umount is used (standalone mode)
 
 Options:
   --skip-ksu-fetch          Skip fetching/updating KernelSU Next submodule (use existing)
-  --backport-path_umount    Backport path_umount from kernel 5.9 (KernelSU original)
-                            Fixes "Umount module" feature on pre-5.9 / pre-GKI kernels
-                            Only valid with 'manual' method (ignored for kprobe)
+  --backport-path_umount    STANDALONE MODE: only apply path_umount backport to
+                            fs/namespace.c (KernelSU original, for pre-5.9 kernels)
+                            Skips ALL other steps (KSU source, manual patches, defconfig)
+                            When set, defconfig_path is optional
 
 Methods:
   kprobe   - Uses kprobe hooks (recommended if kprobe works on your kernel)
@@ -210,29 +212,40 @@ Methods:
   manual   - Direct source code patches (for kernels where kprobe is broken
              or kernel version < 4.14)
 
+Standalone Mode (--backport-path_umount):
+  When this flag is set, the script ONLY patches fs/namespace.c with the
+  path_umount backport from kernel 5.9 (KernelSU original). All other steps
+  are skipped: no KSU source fetch, no manual hooks, no defconfig updates.
+  Useful when KSU integration is already done but 'Umount module' feature
+  is broken on pre-5.9 kernels.
+
 KernelSU Source:
   Uses external/KernelSU-Next git submodule (legacy branch) from lavender root.
   Submodule is auto-initialized on first run. Subsequent runs update it.
 
 Examples:
+  # Full integration
   $SCRIPT_NAME kprobe /path/to/kernel vendor/lavender_defconfig
   $SCRIPT_NAME manual /path/to/kernel lavender_defconfig
   $SCRIPT_NAME --skip-ksu-fetch manual /path/to/kernel vendor/lavender-perf_defconfig
-  $SCRIPT_NAME --backport-path_umount manual /path/to/kernel lavender_defconfig
+
+  # Standalone: only apply path_umount backport (no defconfig needed)
+  $SCRIPT_NAME manual /path/to/kernel --backport-path_umount
+  $SCRIPT_NAME --backport-path_umount manual /path/to/kernel
 
 Notes:
   - Kernel source must be buildable (bootable kernel from source)
   - For manual method: patches 5 kernel files with KSU hooks
   - For kprobe method: enables required kprobe configs in defconfig
-  - --backport-path_umount adds an extra patch to fs/namespace.c (manual only)
+  - --backport-path_umount = standalone mode (only fs/namespace.c patch)
   - Run from kernel source root or provide absolute paths
 EOF
 }
 
 validate_args() {
-    [[ $# -ge 3 ]] || { show_usage; die "Expected at least 3 arguments, got $#"; }
+    [[ $# -ge 2 ]] || { show_usage; die "Expected at least 2 arguments, got $#"; }
 
-    # Parse optional flags
+    # Parse optional flags first (so we know if we're in standalone mode)
     local args=()
     for arg in "$@"; do
         case "$arg" in
@@ -242,39 +255,57 @@ validate_args() {
         esac
     done
 
-    [[ ${#args[@]} -eq 3 ]] || { show_usage; die "Expected 3 arguments (method, kernel_source_dir, defconfig_path), got ${#args[@]}"; }
+    # In standalone mode (--backport-path_umount), defconfig_path is optional
+    if [[ $BACKPORT_PATH_UMOUNT -eq 1 ]]; then
+        [[ ${#args[@]} -ge 2 && ${#args[@]} -le 3 ]] \
+            || { show_usage; die "Standalone mode expects 2-3 arguments (method, kernel_source_dir, [defconfig_path]), got ${#args[@]}"; }
+    else
+        [[ ${#args[@]} -eq 3 ]] \
+            || { show_usage; die "Expected 3 arguments (method, kernel_source_dir, defconfig_path), got ${#args[@]}"; }
+    fi
 
     METHOD="${args[0]}"
     KERNEL_SRC="$(realpath "${args[1]}")"
-    DEFCONFIG_INPUT="${args[2]}"
-
-    [[ "$METHOD" == "manual" || "$METHOD" == "kprobe" ]] \
-        || die "Invalid method: '$METHOD'. Must be 'manual' or 'kprobe'"
 
     [[ -d "$KERNEL_SRC" ]] || die "Kernel source directory not found: $KERNEL_SRC"
     [[ -w "$KERNEL_SRC" ]] || die "Kernel source directory not writable: $KERNEL_SRC"
 
-    # Resolve defconfig path (relative to kernel_source/arch/arm64/configs/ unless absolute)
-    if [[ "$DEFCONFIG_INPUT" = /* ]]; then
-        DEFCONFIG_PATH="$DEFCONFIG_INPUT"
+    if [[ $BACKPORT_PATH_UMOUNT -eq 1 ]]; then
+        # Standalone mode: defconfig_path is optional (ignored if provided)
+        DEFCONFIG_PATH=""
+        if [[ ${#args[@]} -eq 3 ]]; then
+            local defconfig_input="${args[2]}"
+            if [[ "$defconfig_input" = /* ]]; then
+                DEFCONFIG_PATH="$defconfig_input"
+            else
+                DEFCONFIG_PATH="$KERNEL_SRC/arch/arm64/configs/$defconfig_input"
+            fi
+            log_debug "Defconfig provided (ignored in standalone mode): $DEFCONFIG_PATH"
+        fi
+        log_info "Standalone mode: --backport-path_umount"
+        log_info "  Only fs/namespace.c will be patched (path_umount backport)"
+        log_info "  Skipping: KSU source fetch, manual patches, defconfig updates"
     else
-        DEFCONFIG_PATH="$KERNEL_SRC/arch/arm64/configs/$DEFCONFIG_INPUT"
-    fi
+        # Normal mode: validate method and defconfig
+        [[ "$METHOD" == "manual" || "$METHOD" == "kprobe" ]] \
+            || die "Invalid method: '$METHOD'. Must be 'manual' or 'kprobe'"
 
-    [[ -f "$DEFCONFIG_PATH" ]] || die "Defconfig not found: $DEFCONFIG_PATH"
-    [[ -w "$DEFCONFIG_PATH" ]] || die "Defconfig not writable: $DEFCONFIG_PATH"
+        local defconfig_input="${args[2]}"
+        if [[ "$defconfig_input" = /* ]]; then
+            DEFCONFIG_PATH="$defconfig_input"
+        else
+            DEFCONFIG_PATH="$KERNEL_SRC/arch/arm64/configs/$defconfig_input"
+        fi
+
+        [[ -f "$DEFCONFIG_PATH" ]] || die "Defconfig not found: $DEFCONFIG_PATH"
+        [[ -w "$DEFCONFIG_PATH" ]] || die "Defconfig not writable: $DEFCONFIG_PATH"
+    fi
 
     log_debug "Method: $METHOD"
     log_debug "Kernel source: $KERNEL_SRC"
-    log_debug "Defconfig: $DEFCONFIG_PATH"
+    log_debug "Defconfig: ${DEFCONFIG_PATH:-<none>}"
     log_debug "Skip KSU fetch: $SKIP_KSU_FETCH"
     log_debug "Backport path_umount: $BACKPORT_PATH_UMOUNT"
-
-    # Validate flag-method compatibility
-    if [[ $BACKPORT_PATH_UMOUNT -eq 1 && "$METHOD" != "manual" ]]; then
-        log_warn "--backport-path_umount only applies to 'manual' method; ignoring flag"
-        BACKPORT_PATH_UMOUNT=0
-    fi
 }
 
 # ============================================================================
@@ -391,15 +422,29 @@ check_prerequisites() {
     log_step "Checking prerequisites"
 
     local missing=()
-    for cmd in curl git make grep sed awk find; do
-        command -v "$cmd" >/dev/null || missing+=("$cmd")
-    done
+    if [[ $BACKPORT_PATH_UMOUNT -eq 1 ]]; then
+        # Standalone mode: only need text-processing tools (no curl/git/make)
+        for cmd in grep sed awk find; do
+            command -v "$cmd" >/dev/null || missing+=("$cmd")
+        done
+    else
+        # Full integration: need all tools
+        for cmd in curl git make grep sed awk find; do
+            command -v "$cmd" >/dev/null || missing+=("$cmd")
+        done
+    fi
 
     [[ ${#missing[@]} -eq 0 ]] || die "Missing required commands: ${missing[*]}"
 
     # Verify it's a kernel source tree
     [[ -f "$KERNEL_SRC/Makefile" && -f "$KERNEL_SRC/Kconfig" ]] \
         || die "Not a valid kernel source tree: $KERNEL_SRC"
+
+    # In standalone mode, also verify fs/namespace.c exists
+    if [[ $BACKPORT_PATH_UMOUNT -eq 1 ]]; then
+        [[ -f "$KERNEL_SRC/$BACKPORT_PATH_UMOUNT_FILE" ]] \
+            || die "namespace.c not found at: $KERNEL_SRC/$BACKPORT_PATH_UMOUNT_FILE"
+    fi
 
     log_success "Prerequisites satisfied"
 }
@@ -1202,6 +1247,16 @@ apply_kprobe_configs() {
 verify_integration() {
     log_step "Verifying integration"
 
+    # Standalone mode: only verify path_umount backport
+    if [[ $BACKPORT_PATH_UMOUNT -eq 1 ]]; then
+        local ns_file="$KERNEL_SRC/$BACKPORT_PATH_UMOUNT_FILE"
+        [[ -f "$ns_file" ]] || die "namespace.c not found: $ns_file"
+        grep -q "$BACKPORT_PATH_UMOUNT_HOOK" "$ns_file" \
+            || die "path_umount backport not found in $BACKPORT_PATH_UMOUNT_FILE"
+        log_success "path_umount backport verified in $BACKPORT_PATH_UMOUNT_FILE"
+        return
+    fi
+
     # Check KernelSU source exists (external submodule structure)
     [[ -d "$KSU_KERNEL_SOURCE" ]] || die "KernelSU kernel source missing at $KSU_KERNEL_SOURCE"
     [[ -f "$KSU_KERNEL_SOURCE/Kconfig" ]] || die "KernelSU source incomplete - Kconfig missing"
@@ -1239,13 +1294,6 @@ verify_integration() {
             die "Manual patches incomplete. Missing hooks in: ${missing_hooks[*]}"
         fi
 
-        # Verify optional path_umount backport if flag was set
-        if [[ $BACKPORT_PATH_UMOUNT -eq 1 ]]; then
-            grep -q "$BACKPORT_PATH_UMOUNT_HOOK" "$KERNEL_SRC/$BACKPORT_PATH_UMOUNT_FILE" \
-                || die "path_umount backport not found in $BACKPORT_PATH_UMOUNT_FILE"
-            log_success "path_umount backport verified in $BACKPORT_PATH_UMOUNT_FILE"
-        fi
-
         # Verify manual method configs
         grep -q "^CONFIG_KSU_MANUAL_HOOK=y" "$DEFCONFIG_PATH" || log_warn "Config not set: CONFIG_KSU_MANUAL_HOOK"
     fi
@@ -1259,10 +1307,35 @@ verify_integration() {
 main() {
     validate_args "$@"
     check_prerequisites
-    
+
     log_info "KernelSU Next Legacy Integration Script v$SCRIPT_VERSION"
-    log_info "Method: $METHOD | Kernel: $KERNEL_SRC | Defconfig: $DEFCONFIG_PATH"
-    
+    log_info "Method: $METHOD | Kernel: $KERNEL_SRC | Defconfig: ${DEFCONFIG_PATH:-<none>}"
+
+    # =========================================================================
+    # Standalone mode: --backport-path_umount
+    # Only apply path_umount backport to fs/namespace.c. Skip everything else.
+    # =========================================================================
+    if [[ $BACKPORT_PATH_UMOUNT -eq 1 ]]; then
+        log_step "Standalone mode: path_umount backport only"
+
+        apply_path_umount_backport || die "path_umount backport failed"
+
+        verify_integration
+
+        log_step "Integration Complete"
+        log_success "path_umount backport applied to $KERNEL_SRC/$BACKPORT_PATH_UMOUNT_FILE"
+        log_info "This enables 'Umount module' feature on pre-5.9 / pre-GKI kernels"
+        log_info "Backup file created: $KERNEL_SRC/$BACKPORT_PATH_UMOUNT_FILE.ksun-backup.*"
+        log_info "Next steps:"
+        log_info "  1. Build your kernel: make -C $KERNEL_SRC"
+        log_info "  2. Flash the resulting boot.img"
+        return
+    fi
+
+    # =========================================================================
+    # Normal flow: full KSU integration
+    # =========================================================================
+
     # Pre-flight detection of existing KSU integration
     detect_existing_ksu
 
@@ -1279,11 +1352,6 @@ main() {
             update_defconfig "CONFIG_KSU_KPROBE_HOOKS=n" "CONFIG_KPROBES=n" "CONFIG_KPROBE_EVENTS=n"
             update_defconfig "${MANUAL_CONFIGS[@]}"
             apply_manual_patches
-
-            # Optional: backport path_umount from KernelSU original (pre-5.9 kernels)
-            if [[ $BACKPORT_PATH_UMOUNT -eq 1 ]]; then
-                apply_path_umount_backport || die "path_umount backport failed"
-            fi
             ;;
     esac
 
@@ -1298,10 +1366,6 @@ main() {
 
     if [[ "$METHOD" == "manual" ]]; then
         log_info "  Backup files created: *.ksun-backup.* in each patched directory"
-        if [[ $BACKPORT_PATH_UMOUNT -eq 1 ]]; then
-            log_info "  path_umount backport applied to fs/namespace.c (KernelSU original)"
-            log_info "  This enables 'Umount module' feature on pre-5.9 / pre-GKI kernels"
-        fi
     fi
 }
 
