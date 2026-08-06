@@ -14,8 +14,13 @@ set -euo pipefail
 # ============================================================================
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly SCRIPT_VERSION="1.0.0"
-readonly KSU_SETUP_URL="https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh"
 readonly KSU_LEGACY_BRANCH="legacy"
+
+# Lavender root (where external/KernelSU-Next submodule lives)
+# Script is at scripts/ksun-install, so root is parent of script dir
+readonly LAVENDER_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+readonly KSU_SUBMODULE_PATH="$LAVENDER_ROOT/external/KernelSU-Next"
+readonly KSU_KERNEL_SOURCE="$KSU_SUBMODULE_PATH/kernel"
 
 # Options
 SKIP_KSU_FETCH=0
@@ -182,10 +187,10 @@ Integrate KernelSU Next (legacy/non-GKI) into a kernel source tree.
 Arguments:
   method            Integration method: 'manual' or 'kprobe'
   kernel_source_dir Path to kernel source tree (must exist and be writable)
-  defconfig_path    Path to defconfig file (relative to kernel source or absolute)
+  defconfig_path    Defconfig filename (relative to kernel_source/arch/arm64/configs/ or absolute)
 
 Options:
-  --skip-ksu-fetch  Skip fetching/updating KernelSU Next source (use existing)
+  --skip-ksu-fetch  Skip fetching/updating KernelSU Next submodule (use existing)
 
 Methods:
   kprobe   - Uses kprobe hooks (recommended if kprobe works on your kernel)
@@ -193,10 +198,14 @@ Methods:
   manual   - Direct source code patches (for kernels where kprobe is broken
              or kernel version < 4.14)
 
+KernelSU Source:
+  Uses external/KernelSU-Next git submodule (legacy branch) from lavender root.
+  Submodule is auto-initialized on first run. Subsequent runs update it.
+
 Examples:
-  $SCRIPT_NAME kprobe /path/to/kernel arch/arm64/configs/vendor/lavender_defconfig
-  $SCRIPT_NAME manual /path/to/kernel arch/arm64/configs/lavender_defconfig
-  $SCRIPT_NAME --skip-ksu-fetch manual /path/to/kernel arch/arm64/configs/lavender_defconfig
+  $SCRIPT_NAME kprobe /path/to/kernel vendor/lavender_defconfig
+  $SCRIPT_NAME manual /path/to/kernel lavender_defconfig
+  $SCRIPT_NAME --skip-ksu-fetch manual /path/to/kernel vendor/lavender-perf_defconfig
 
 Notes:
   - Kernel source must be buildable (bootable kernel from source)
@@ -230,11 +239,11 @@ validate_args() {
     [[ -d "$KERNEL_SRC" ]] || die "Kernel source directory not found: $KERNEL_SRC"
     [[ -w "$KERNEL_SRC" ]] || die "Kernel source directory not writable: $KERNEL_SRC"
 
-    # Resolve defconfig path
+    # Resolve defconfig path (relative to kernel_source/arch/arm64/configs/ unless absolute)
     if [[ "$DEFCONFIG_INPUT" = /* ]]; then
         DEFCONFIG_PATH="$DEFCONFIG_INPUT"
     else
-        DEFCONFIG_PATH="$KERNEL_SRC/$DEFCONFIG_INPUT"
+        DEFCONFIG_PATH="$KERNEL_SRC/arch/arm64/configs/$DEFCONFIG_INPUT"
     fi
 
     [[ -f "$DEFCONFIG_PATH" ]] || die "Defconfig not found: $DEFCONFIG_PATH"
@@ -260,10 +269,20 @@ detect_existing_ksu() {
     local kprobe_configs_found=()
     local kprobe_configs_missing=()
     
-    # Check KernelSU-Next source
-    if [[ -d "$KERNEL_SRC/KernelSU-Next" ]] && [[ -L "$KERNEL_SRC/drivers/kernelsu" ]]; then
+    # Find drivers directory
+    local driver_dir
+    if [[ -d "$KERNEL_SRC/common/drivers" ]]; then
+        driver_dir="common/drivers"
+    elif [[ -d "$KERNEL_SRC/drivers" ]]; then
+        driver_dir="drivers"
+    else
+        driver_dir="drivers"  # default for checks
+    fi
+
+    # Check KernelSU source (submodule) and symlink in kernel tree
+    if [[ -d "$KSU_KERNEL_SOURCE" ]] && [[ -L "$KERNEL_SRC/$driver_dir/kernelsu" ]]; then
         has_ksu_source=1
-        log_info "KernelSU-Next source detected: $KERNEL_SRC/KernelSU-Next"
+        log_info "KernelSU-Next source detected: $KSU_KERNEL_SOURCE (symlinked in $driver_dir/kernelsu)"
     fi
     
     # Check manual patches in kernel source
@@ -383,37 +402,112 @@ restore_backup() {
 }
 
 # ============================================================================
-# KernelSU Next Source Integration
+# KernelSU Next Source Integration (using external submodule)
 # ============================================================================
 fetch_ksu_source() {
-    log_step "Fetching KernelSU Next source (legacy branch)"
+    log_step "Setting up KernelSU Next from submodule (legacy branch)"
+
+    # Ensure submodule exists and is initialized
+    if [[ ! -d "$KSU_SUBMODULE_PATH/.git" && ! -f "$KSU_SUBMODULE_PATH/.git" ]]; then
+        if [[ $SKIP_KSU_FETCH -eq 1 ]]; then
+            die "KernelSU-Next submodule not initialized at $KSU_SUBMODULE_PATH and --skip-ksu-fetch specified. Run 'git submodule update --init external/KernelSU-Next' first."
+        fi
+        log_info "Initializing KernelSU-Next submodule..."
+        git -C "$LAVENDER_ROOT" submodule update --init --recursive external/KernelSU-Next
+    fi
+
+    # Ensure we're on the legacy branch
+    local current_branch
+    current_branch=$(git -C "$KSU_SUBMODULE_PATH" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+    if [[ "$current_branch" != "$KSU_LEGACY_BRANCH" ]]; then
+        log_info "Switching KernelSU-Next to '$KSU_LEGACY_BRANCH' branch..."
+        git -C "$KSU_SUBMODULE_PATH" checkout "$KSU_LEGACY_BRANCH" 2>/dev/null || \
+            die "Failed to checkout '$KSU_LEGACY_BRANCH' branch in submodule"
+    fi
+
+    # Optionally update submodule (unless skipped)
+    if [[ $SKIP_KSU_FETCH -eq 0 ]]; then
+        log_info "Updating KernelSU-Next submodule..."
+        git -C "$KSU_SUBMODULE_PATH" fetch origin 2>/dev/null || log_warn "Git fetch failed (network issue?), continuing with existing source"
+        git -C "$KSU_SUBMODULE_PATH" pull origin "$KSU_LEGACY_BRANCH" 2>/dev/null || true
+    else
+        log_info "Skipping submodule update (--skip-ksu-fetch specified)"
+    fi
+
+    # Verify KernelSU source structure
+    [[ -d "$KSU_KERNEL_SOURCE" ]] || die "KernelSU kernel source not found at $KSU_KERNEL_SOURCE"
+    [[ -f "$KSU_KERNEL_SOURCE/Kconfig" ]] || die "KernelSU source incomplete - Kconfig missing"
+    [[ -f "$KSU_KERNEL_SOURCE/core/init.c" ]] || die "KernelSU source incomplete - core/init.c missing"
+
+    # Integrate into kernel source: symlink, Makefile, Kconfig
+    integrate_ksu_into_kernel
+
+    log_success "KernelSU Next source integrated from submodule"
+}
+
+# Integrate KernelSU into kernel source tree (replaces setup.sh logic)
+integrate_ksu_into_kernel() {
+    log_step "Integrating KernelSU into kernel source tree"
 
     cd "$KERNEL_SRC"
 
-    # Check if already integrated - KernelSU-Next creates KernelSU-Next dir and drivers/kernelsu symlink
-    if [[ -d "KernelSU-Next" ]] && [[ -L "drivers/kernelsu" ]]; then
-        log_info "KernelSU Next already present."
-        if [[ $SKIP_KSU_FETCH -eq 0 ]]; then
-            log_info "Updating (use --skip-ksu-fetch to skip)..."
-            git -C "KernelSU-Next" fetch origin 2>/dev/null || log_warn "Git fetch failed (network issue?), continuing with existing source"
-            git -C "KernelSU-Next" checkout "$KSU_LEGACY_BRANCH" 2>/dev/null || true
-            git -C "KernelSU-Next" pull origin "$KSU_LEGACY_BRANCH" 2>/dev/null || true
-        else
-            log_info "Skipping fetch/update (--skip-ksu-fetch specified)"
-        fi
+    # Find drivers directory (GKI: common/drivers, traditional: drivers)
+    local driver_dir
+    if [[ -d "common/drivers" ]]; then
+        driver_dir="common/drivers"
+    elif [[ -d "drivers" ]]; then
+        driver_dir="drivers"
     else
-        if [[ $SKIP_KSU_FETCH -eq 1 ]]; then
-            die "KernelSU-Next not found and --skip-ksu-fetch specified. Run without --skip-ksu-fetch first, or manually add KernelSU source."
-        fi
-        log_info "Running KernelSU Next setup script (legacy branch)..."
-        curl -LSs "$KSU_SETUP_URL" | bash -s "$KSU_LEGACY_BRANCH"
+        die "Could not find drivers/ directory in kernel source"
     fi
 
-    [[ -d "KernelSU-Next" ]] || die "KernelSU source integration failed - KernelSU-Next directory not found"
-    [[ -f "KernelSU-Next/kernel/Kconfig" ]] || die "KernelSU source appears incomplete - Kconfig missing"
-    [[ -f "KernelSU-Next/kernel/core/init.c" ]] || die "KernelSU source appears incomplete - init.c missing"
+    local driver_makefile="$driver_dir/Makefile"
+    local driver_kconfig="$driver_dir/Kconfig"
+    local kernelsu_symlink="$driver_dir/kernelsu"
 
-    log_success "KernelSU Next source integrated"
+    # Compute relative path from driver_dir to KernelSU kernel source
+    local rel_path
+    rel_path=$(realpath --relative-to="$(pwd)/$driver_dir" "$KSU_KERNEL_SOURCE")
+
+    # 1. Create/update symlink: drivers/kernelsu -> external/KernelSU-Next/kernel
+    if [[ -L "$kernelsu_symlink" ]]; then
+        local current_target
+        current_target=$(readlink "$kernelsu_symlink")
+        if [[ "$current_target" != "$rel_path" ]]; then
+            log_info "Updating kernelsu symlink: $current_target -> $rel_path"
+            rm "$kernelsu_symlink"
+            ln -sf "$rel_path" "$kernelsu_symlink"
+        else
+            log_debug "kernelsu symlink already correct"
+        fi
+    elif [[ -e "$kernelsu_symlink" ]]; then
+        die "$kernelsu_symlink exists but is not a symlink. Remove it manually first."
+    else
+        log_info "Creating kernelsu symlink -> $rel_path"
+        ln -sf "$rel_path" "$kernelsu_symlink"
+    fi
+
+    # 2. Update drivers/Makefile: add obj-$(CONFIG_KSU) += kernelsu/
+    if grep -q "kernelsu" "$driver_makefile"; then
+        log_debug "Makefile already has kernelsu entry"
+    else
+        log_info "Adding kernelsu to $driver_makefile"
+        printf "\nobj-\$(CONFIG_KSU) += kernelsu/\n" >> "$driver_makefile"
+    fi
+
+    # 3. Update drivers/Kconfig: add source "drivers/kernelsu/Kconfig" before endmenu
+    if grep -q 'source "drivers/kernelsu/Kconfig"' "$driver_kconfig"; then
+        log_debug "Kconfig already has kernelsu entry"
+    else
+        log_info "Adding kernelsu to $driver_kconfig"
+        # Insert before 'endmenu' - use a temp file for safety
+        local tmp_kconfig
+        tmp_kconfig=$(mktemp)
+        awk '/^endmenu/ && !done { print "source \"drivers/kernelsu/Kconfig\""; done=1 } { print }' "$driver_kconfig" > "$tmp_kconfig"
+        mv "$tmp_kconfig" "$driver_kconfig"
+    fi
+
+    log_success "KernelSU integrated into kernel source ($driver_dir)"
 }
 
 # ============================================================================
@@ -921,10 +1015,21 @@ apply_kprobe_configs() {
 verify_integration() {
     log_step "Verifying integration"
 
-    # Check KernelSU source exists (KernelSU-Next structure)
-    [[ -d "$KERNEL_SRC/KernelSU-Next" ]] || die "KernelSU-Next directory missing"
-    [[ -f "$KERNEL_SRC/KernelSU-Next/kernel/Kconfig" ]] || die "KernelSU source incomplete - Kconfig missing"
-    [[ -f "$KERNEL_SRC/KernelSU-Next/kernel/core/init.c" ]] || die "KernelSU source incomplete - init.c missing"
+    # Check KernelSU source exists (external submodule structure)
+    [[ -d "$KSU_KERNEL_SOURCE" ]] || die "KernelSU kernel source missing at $KSU_KERNEL_SOURCE"
+    [[ -f "$KSU_KERNEL_SOURCE/Kconfig" ]] || die "KernelSU source incomplete - Kconfig missing"
+    [[ -f "$KSU_KERNEL_SOURCE/core/init.c" ]] || die "KernelSU source incomplete - core/init.c missing"
+
+    # Check symlink exists in kernel source
+    local driver_dir
+    if [[ -d "$KERNEL_SRC/common/drivers" ]]; then
+        driver_dir="common/drivers"
+    elif [[ -d "$KERNEL_SRC/drivers" ]]; then
+        driver_dir="drivers"
+    else
+        die "Could not find drivers/ directory in kernel source"
+    fi
+    [[ -L "$KERNEL_SRC/$driver_dir/kernelsu" ]] || die "kernelsu symlink missing in $driver_dir"
 
     # Check defconfig has CONFIG_KSU
     grep -q "^CONFIG_KSU=y" "$DEFCONFIG_PATH" || die "CONFIG_KSU not enabled in defconfig"
