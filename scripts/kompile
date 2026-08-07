@@ -7,7 +7,7 @@ TOOLCHAINS_BASE_DIR="$BASE_DIR/toolchains"
 
 usage() {
     cat <<EOF
-Usage: $SCRIPT_NAME [toolchain] [kernel source dir] [defconfig] [options]
+Usage: $SCRIPT_NAME [toolchain] [<kernel_source_dir>] [defconfig] [options]
 
 Toolchains:
   san-gcc   - SAN-GCC (GCC-based cross-compiler)
@@ -17,9 +17,9 @@ Toolchains:
 
 Arguments:
   toolchain         Required. One of: san-gcc, neutron, azure, proton
-  kernel source dir Required. Path to kernel source directory
+  kernel_source_dir Optional. Path to kernel source directory (default: current working directory)
   defconfig         Optional. Defconfig name (relative to arch/arm64/configs/).
-                    Required unless --continue is used.
+                    Required unless --continue is used or default exists for toolchain.
 
 Options:
   --continue, --resume   Skip kernel configuration (resume previous build)
@@ -41,11 +41,18 @@ Environment:
   CCACHE_MAXSIZE         ccache max size (default: 50G)
 
 Examples:
-  $SCRIPT_NAME san-gcc ./sajad-kernel lavender_defconfig
-  $SCRIPT_NAME neutron ./scarlet-kernel vendor/lavender-perf_defconfig --clean
-  $SCRIPT_NAME azure ./sajad-kernel lavender_defconfig --out build-out
-  $SCRIPT_NAME proton ./sajad-kernel --continue
-  $SCRIPT_NAME neutron ./kernel main_defconfig --frag vendor/special.config
+  # From kernel source directory (cwd = kernel source)
+  $SCRIPT_NAME san-gcc lavender_defconfig
+  $SCRIPT_NAME neutron vendor/lavender-perf_defconfig --clean
+  $SCRIPT_NAME azure lavender_defconfig --out build-out
+  $SCRIPT_NAME proton --continue
+
+  # With explicit kernel source directory
+  $SCRIPT_NAME san-gcc /path/to/kernel lavender_defconfig
+  $SCRIPT_NAME neutron /path/to/kernel vendor/lavender-perf_defconfig --clean
+  $SCRIPT_NAME azure /path/to/kernel lavender_defconfig --out build-out
+  $SCRIPT_NAME proton /path/to/kernel --continue
+  $SCRIPT_NAME neutron /path/to/kernel main_defconfig --frag vendor/special.config
 EOF
     exit 1
 }
@@ -76,6 +83,8 @@ USE_CCACHE=true
 BUILD_DTBS=false
 BUILD_DTBO=false
 
+# First pass: collect positional args and flags separately
+POSITIONAL_ARGS=()
 while [[ $# -gt 0 ]]; do
     case $1 in
         --continue|--resume)
@@ -123,28 +132,32 @@ while [[ $# -gt 0 ]]; do
             error "Unknown option: $1"
             ;;
         *)
-            if [[ -z $TOOLCHAIN ]]; then
-                TOOLCHAIN="$1"
-            elif [[ -z $KERNEL_DIR ]]; then
-                KERNEL_DIR="$1"
-            elif [[ -z $DEFCONFIG && $CONTINUE_BUILD == false ]]; then
-                DEFCONFIG="$1"
-            else
-                error "Too many positional arguments: $1"
-            fi
+            POSITIONAL_ARGS+=("$1")
             shift
             ;;
     esac
 done
 
 # Validate required arguments
-[[ -z $TOOLCHAIN ]] && error "Toolchain is required. Use --help for usage."
-[[ -z $KERNEL_DIR ]] && error "Kernel source directory is required."
+[[ -z ${POSITIONAL_ARGS[0]:-} ]] && error "Toolchain is required. Use --help for usage."
+TOOLCHAIN="${POSITIONAL_ARGS[0]}"
 
 # Validate toolchain early
 VALID_TOOLCHAINS="san-gcc neutron azure proton"
 if [[ ! " $VALID_TOOLCHAINS " =~ " $TOOLCHAIN " ]]; then
     error "Invalid toolchain: $TOOLCHAIN. Valid options: $VALID_TOOLCHAINS"
+fi
+
+# Resolve kernel directory (default to cwd if not provided)
+# POSITIONAL_ARGS[1] might be kernel dir or defconfig
+if [[ ${#POSITIONAL_ARGS[@]} -ge 2 && -d "${POSITIONAL_ARGS[1]}" ]]; then
+    # Second arg is a directory path -> kernel source dir
+    KERNEL_DIR="${POSITIONAL_ARGS[1]}"
+    DEFCONFIG="${POSITIONAL_ARGS[2]:-}"
+else
+    # No explicit kernel dir, use current directory
+    KERNEL_DIR="."
+    DEFCONFIG="${POSITIONAL_ARGS[1]:-}"
 fi
 
 # Validate flag conflicts
@@ -322,8 +335,11 @@ if [[ $USE_CCACHE == true ]]; then
         export CCACHE_NOHASHDIR=1
         export CCACHE_BASEDIR="$KERNEL_DIR"
         export CCACHE_SLOPPINESS=time_macros,file_macro,include_file_mtime,include_file_ctime,pch_defines,system_headers
+        export CCACHE_COMPILERCHECK=mtime
+        # Uncomment below for ccache debug output (shows why misses happen):
+        # export CCACHE_DEBUG=1
+        # export CCACHE_DEBUGDIR="/tmp/ccache-debug"
         log "ccache enabled (dir: $CCACHE_DIR, max: $CCACHE_MAXSIZE, basedir: $KERNEL_DIR)"
-        ccache -z  # zero stats
     else
         warn "ccache not found, continuing without cache"
         USE_CCACHE=false
@@ -331,9 +347,11 @@ if [[ $USE_CCACHE == true ]]; then
 fi
 
 # Reproducible build metadata (KBUILD_BUILD_*)
+# Use fixed timestamp by default for ccache-friendly reproducible builds.
+# Override with: KBUILD_BUILD_TIMESTAMP="2024-01-01 00:00:00 +0000" ./scripts/kompile ...
 export KBUILD_BUILD_USER="${KBUILD_BUILD_USER:-$(whoami)}"
 export KBUILD_BUILD_HOST="${KBUILD_BUILD_HOST:-$(hostname)}"
-export KBUILD_BUILD_TIMESTAMP="${KBUILD_BUILD_TIMESTAMP:-$(date -u +"%Y-%m-%d %H:%M:%S %z")}"
+export KBUILD_BUILD_TIMESTAMP="${KBUILD_BUILD_TIMESTAMP:-2024-01-01 00:00:00 +0000}"
 [[ -n "${CI_BUILD_NUMBER:-}" ]] && export KBUILD_BUILD_VERSION="$CI_BUILD_NUMBER"
 
 JOBS=$(( $(nproc) - 1 ))
@@ -493,6 +511,7 @@ echo ""
 if [[ $USE_CCACHE == true ]] && command -v ccache >/dev/null 2>&1; then
     log "ccache statistics:"
     ccache -s
+    ccache -z  # zero stats for next run
     echo ""
 fi
 

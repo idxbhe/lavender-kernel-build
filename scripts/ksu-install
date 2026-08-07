@@ -215,31 +215,33 @@ get_backport_list() {
 
 show_usage() {
     cat <<EOF
-Usage: $SCRIPT_NAME [options] <method> <kernel_source_dir> [defconfig_path]
+Usage: $SCRIPT_NAME [options] <method> [<kernel_source_dir>] [defconfig_path]
+       $SCRIPT_NAME [<kernel_source_dir>] --backport-<name>...
 
 Integrate KernelSU (original/tiann, non-GKI) into a kernel source tree.
 
-Arguments:
+Arguments (Full Integration):
   method            Integration method: 'manual' or 'kprobe'
-  kernel_source_dir Path to kernel source tree (must exist and be writable)
+  kernel_source_dir Path to kernel source tree (default: current working directory)
   defconfig_path    Defconfig filename (relative to kernel_source/arch/arm64/configs/ or absolute)
-                    Optional when --backport-* flags are used (standalone mode)
+
+Arguments (Standalone Backport Mode):
+  kernel_source_dir Path to kernel source tree (default: current working directory)
+  --backport-<name> Apply ONLY the specified backport(s) (no method argument)
 
 Options:
   --skip-ksu-fetch          Skip fetching/updating KernelSU submodule (use existing)
 
-Standalone Backport Options (each can work independently):
+Backport Options (work in BOTH modes):
   --backport-path_umount    Backport path_umount from kernel 5.9 → fs/namespace.c
                             Fixes "Umount module" feature on pre-5.9 / pre-GKI kernels
   --backport-devpts         Patch fs/devpts/inode.c → fixes "pm execution failed" in terminal
   --backport-safe-mode      Patch drivers/input/input.c → enables KernelSU Safe Mode
   --backport-all            Apply ALL three backports above
 
-  When any --backport-* flag is set, the script enters STANDALONE MODE:
-  only the specified backport(s) are applied. All other steps are skipped
-  (KSU source fetch, manual hooks, defconfig updates). defconfig_path becomes optional.
-
-  Multiple --backport-* flags can be combined (e.g. --backport-devpts --backport-safe-mode).
+  In FULL INTEGRATION mode (with method argument): backports apply IN ADDITION to normal steps
+  In STANDALONE MODE (without method argument): ONLY the specified backport(s) are applied
+  Multiple --backport-* flags can be combined (e.g. --backport-devpts --backport-safe-mode)
 
 Methods:
   kprobe   - Uses kprobe hooks (recommended if kprobe works on your kernel)
@@ -261,91 +263,101 @@ Important:
     SYSCALL_DEFINE3(faccessat), and from vfs_statx to vfs_fstatat.
 
 Examples:
-  # Full integration
+  # Full integration (kernel source = current directory)
+  $SCRIPT_NAME kprobe vendor/lavender_defconfig
+  $SCRIPT_NAME manual lavender_defconfig
+  $SCRIPT_NAME --skip-ksu-fetch manual vendor/lavender-perf_defconfig
+
+  # Full integration with explicit kernel source
   $SCRIPT_NAME kprobe /path/to/kernel vendor/lavender_defconfig
   $SCRIPT_NAME manual /path/to/kernel lavender_defconfig
-  $SCRIPT_NAME --skip-ksu-fetch manual /path/to/kernel vendor/lavender-perf_defconfig
 
-  # Standalone backport mode (no defconfig needed)
-  $SCRIPT_NAME manual /path/to/kernel --backport-path_umount
-  $SCRIPT_NAME manual /path/to/kernel --backport-devpts
-  $SCRIPT_NAME manual /path/to/kernel --backport-safe-mode
-  $SCRIPT_NAME manual /path/to/kernel --backport-all
-  $SCRIPT_NAME manual /path/to/kernel --backport-devpts --backport-safe-mode
+  # Full integration WITH backports (pre-5.9 kernels)
+  $SCRIPT_NAME manual --backport-path_umount lavender_defconfig
+  $SCRIPT_NAME kprobe /path/to/kernel vendor/lavender_defconfig --backport-path_umount --backport-devpts
+
+  # Standalone: only apply backport(s) (no defconfig needed, no method argument)
+  $SCRIPT_NAME --backport-path_umount
+  $SCRIPT_NAME /path/to/kernel --backport-devpts --backport-safe-mode
+  $SCRIPT_NAME --backport-all
 
 Notes:
   - Kernel source must be buildable (bootable kernel from source)
   - For manual method: patches 4 kernel files with KSU hooks
   - For kprobe method: enables required kprobe configs in defconfig
-  - --backport-* flags = standalone mode (only specified patches applied)
+  - --backport-* in full integration = adds backports to normal steps
+  - --backport-* without method = standalone mode (only specified backports)
   - Run from kernel source root or provide absolute paths
 EOF
 }
 
 validate_args() {
-    [[ $# -ge 2 ]] || { show_usage; die "Expected at least 2 arguments, got $#"; }
+    [[ $# -ge 1 ]] || { show_usage; die "Expected at least 1 argument, got $#"; }
 
-    # Parse optional flags first (so we know if we're in standalone mode)
+    # Parse all args to identify flags and positional args
     local args=()
+    local has_backport_path_umount=0
+    local has_backport_devpts=0
+    local has_backport_safe_mode=0
+    local has_backport_all=0
+    
     for arg in "$@"; do
         case "$arg" in
             --skip-ksu-fetch) SKIP_KSU_FETCH=1 ;;
-            --backport-path_umount) BACKPORT_PATH_UMOUNT=1 ;;
-            --backport-devpts) BACKPORT_DEVPTS=1 ;;
-            --backport-safe-mode) BACKPORT_SAFE_MODE=1 ;;
-            --backport-all) BACKPORT_ALL=1 ;;
+            --backport-path_umount) has_backport_path_umount=1 ;;
+            --backport-devpts) has_backport_devpts=1 ;;
+            --backport-safe_mode|--backport-safe-mode) has_backport_safe_mode=1 ;;
+            --backport-all) has_backport_all=1 ;;
             *) args+=("$arg") ;;
         esac
     done
 
     # If --backport-all is set, enable all individual backports
-    if [[ $BACKPORT_ALL -eq 1 ]]; then
-        BACKPORT_PATH_UMOUNT=1
-        BACKPORT_DEVPTS=1
-        BACKPORT_SAFE_MODE=1
+    if [[ $has_backport_all -eq 1 ]]; then
+        has_backport_path_umount=1
+        has_backport_devpts=1
+        has_backport_safe_mode=1
     fi
 
-    # Check if any backport flag is set (for standalone mode detection)
+    BACKPORT_PATH_UMOUNT=$has_backport_path_umount
+    BACKPORT_DEVPTS=$has_backport_devpts
+    BACKPORT_SAFE_MODE=$has_backport_safe_mode
+    BACKPORT_ALL=$has_backport_all
+
+    # Check if any backport flag is set
     if [[ $BACKPORT_PATH_UMOUNT -eq 1 || $BACKPORT_DEVPTS -eq 1 || $BACKPORT_SAFE_MODE -eq 1 ]]; then
         ANY_BACKPORT_SET=1
-    fi
-
-    # In standalone mode (backport flags set), defconfig_path is optional
-    if [[ $ANY_BACKPORT_SET -eq 1 ]]; then
-        [[ ${#args[@]} -ge 2 && ${#args[@]} -le 3 ]] \
-            || { show_usage; die "Standalone backport mode expects 2-3 arguments (method, kernel_source_dir, [defconfig_path]), got ${#args[@]}"; }
     else
-        [[ ${#args[@]} -eq 3 ]] \
-            || { show_usage; die "Expected 3 arguments (method, kernel_source_dir, defconfig_path), got ${#args[@]}"; }
+        ANY_BACKPORT_SET=0
     fi
 
-    METHOD="${args[0]}"
-    KERNEL_SRC="$(realpath "${args[1]}")"
+    # Determine if first positional arg is a method (manual/kprobe) or a kernel directory
+    local first_arg="${args[0]:-}"
+    local is_method=0
+    [[ "$first_arg" == "manual" || "$first_arg" == "kprobe" ]] && is_method=1
 
-    [[ -d "$KERNEL_SRC" ]] || die "Kernel source directory not found: $KERNEL_SRC"
-    [[ -w "$KERNEL_SRC" ]] || die "Kernel source directory not writable: $KERNEL_SRC"
+    if [[ $is_method -eq 1 ]]; then
+        # Full integration mode: method [kernel_source_dir] defconfig_path
+        METHOD="$first_arg"
 
-    if [[ $ANY_BACKPORT_SET -eq 1 ]]; then
-        # Standalone backport mode: defconfig_path is optional (ignored if provided)
-        DEFCONFIG_PATH=""
-        if [[ ${#args[@]} -eq 3 ]]; then
-            local defconfig_input="${args[2]}"
-            if [[ "$defconfig_input" = /* ]]; then
-                DEFCONFIG_PATH="$defconfig_input"
-            else
-                DEFCONFIG_PATH="$KERNEL_SRC/arch/arm64/configs/$defconfig_input"
-            fi
-            log_debug "Defconfig provided (ignored in standalone mode): $DEFCONFIG_PATH"
+        # Check if second arg is a directory (explicit kernel source)
+        if [[ ${#args[@]} -ge 2 && -d "${args[1]}" ]]; then
+            KERNEL_SRC="$(realpath "${args[1]}")"
+            DEFCONFIG_ARG_INDEX=2
+        else
+            KERNEL_SRC="$(realpath ".")"
+            DEFCONFIG_ARG_INDEX=1
         fi
-        log_info "Standalone backport mode"
-        log_info "  Backports to apply: $(get_backport_list)"
-        log_info "  Skipping: KSU source fetch, manual patches, defconfig updates"
-    else
-        # Normal mode: validate method and defconfig
-        [[ "$METHOD" == "manual" || "$METHOD" == "kprobe" ]] \
-            || die "Invalid method: '$METHOD'. Must be 'manual' or 'kprobe'"
 
-        local defconfig_input="${args[2]}"
+        [[ -d "$KERNEL_SRC" ]] || die "Kernel source directory not found: $KERNEL_SRC"
+        [[ -w "$KERNEL_SRC" ]] || die "Kernel source directory not writable: $KERNEL_SRC"
+
+        # Defconfig is required in full integration mode
+        if [[ ${#args[@]} -le $DEFCONFIG_ARG_INDEX ]]; then
+            die "Defconfig path is required in full integration mode"
+        fi
+
+        local defconfig_input="${args[$DEFCONFIG_ARG_INDEX]}"
         if [[ "$defconfig_input" = /* ]]; then
             DEFCONFIG_PATH="$defconfig_input"
         else
@@ -354,6 +366,45 @@ validate_args() {
 
         [[ -f "$DEFCONFIG_PATH" ]] || die "Defconfig not found: $DEFCONFIG_PATH"
         [[ -w "$DEFCONFIG_PATH" ]] || die "Defconfig not writable: $DEFCONFIG_PATH"
+
+        if [[ $ANY_BACKPORT_SET -eq 1 ]]; then
+            log_info "Full integration mode with backport(s) enabled: $(get_backport_list)"
+        fi
+
+    else
+        # Standalone backport mode: [kernel_source_dir] --backport-*
+        [[ $ANY_BACKPORT_SET -eq 1 ]] || die "Standalone backport mode requires at least one --backport-* flag"
+
+        METHOD="standalone"
+
+        # Check if first arg is a directory (explicit kernel source)
+        if [[ ${#args[@]} -ge 1 && -d "${args[0]}" ]]; then
+            KERNEL_SRC="$(realpath "${args[0]}")"
+        else
+            KERNEL_SRC="$(realpath ".")"
+        fi
+
+        [[ -d "$KERNEL_SRC" ]] || die "Kernel source directory not found: $KERNEL_SRC"
+        [[ -w "$KERNEL_SRC" ]] || die "Kernel source directory not writable: $KERNEL_SRC"
+
+        # Verify target backport files exist for standalone mode
+        if [[ $BACKPORT_PATH_UMOUNT -eq 1 ]]; then
+            [[ -f "$KERNEL_SRC/$BACKPORT_PATH_UMOUNT_FILE" ]] \
+                || die "namespace.c not found: $KERNEL_SRC/$BACKPORT_PATH_UMOUNT_FILE"
+        fi
+        if [[ $BACKPORT_DEVPTS -eq 1 ]]; then
+            [[ -f "$KERNEL_SRC/$BACKPORT_DEVPTS_FILE" ]] \
+                || die "devpts/inode.c not found: $KERNEL_SRC/$BACKPORT_DEVPTS_FILE"
+        fi
+        if [[ $BACKPORT_SAFE_MODE -eq 1 ]]; then
+            [[ -f "$KERNEL_SRC/$BACKPORT_SAFE_MODE_FILE" ]] \
+                || die "input.c not found: $KERNEL_SRC/$BACKPORT_SAFE_MODE_FILE"
+        fi
+
+        DEFCONFIG_PATH=""
+        log_info "Standalone backport mode"
+        log_info "  Backports to apply: $(get_backport_list)"
+        log_info "  Skipping: KSU source fetch, manual patches, defconfig updates"
     fi
 
     log_debug "Method: $METHOD"
@@ -574,7 +625,9 @@ fetch_ksu_source() {
     # Verify KernelSU source structure
     [[ -d "$KSU_KERNEL_SOURCE" ]] || die "KernelSU kernel source not found at $KSU_KERNEL_SOURCE"
     [[ -f "$KSU_KERNEL_SOURCE/Kconfig" ]] || die "KernelSU source incomplete - Kconfig missing"
-    [[ -f "$KSU_KERNEL_SOURCE/core/init.c" ]] || die "KernelSU source incomplete - core/init.c missing"
+    # KernelSU original (v0.9.5) uses core_hook.c, not core/init.c
+    [[ -f "$KSU_KERNEL_SOURCE/core_hook.c" ]] || die "KernelSU source incomplete - core_hook.c missing"
+    [[ -f "$KSU_KERNEL_SOURCE/ksu.c" ]] || die "KernelSU source incomplete - ksu.c missing"
 
     # Integrate into kernel source: symlink, Makefile, Kconfig
     integrate_ksu_into_kernel
@@ -1376,7 +1429,7 @@ verify_integration() {
     log_step "Verifying integration"
 
     # Standalone backport mode: only verify the specific backport patches
-    if [[ $ANY_BACKPORT_SET -eq 1 ]]; then
+    if [[ "$METHOD" == "standalone" ]]; then
         local backport_errors=()
 
         if [[ $BACKPORT_PATH_UMOUNT -eq 1 ]]; then
@@ -1421,7 +1474,9 @@ verify_integration() {
     # Check KernelSU source exists (external submodule structure)
     [[ -d "$KSU_KERNEL_SOURCE" ]] || die "KernelSU kernel source missing at $KSU_KERNEL_SOURCE"
     [[ -f "$KSU_KERNEL_SOURCE/Kconfig" ]] || die "KernelSU source incomplete - Kconfig missing"
-    [[ -f "$KSU_KERNEL_SOURCE/core/init.c" ]] || die "KernelSU source incomplete - core/init.c missing"
+    # KernelSU original (v0.9.5) uses core_hook.c, not core/init.c
+    [[ -f "$KSU_KERNEL_SOURCE/core_hook.c" ]] || die "KernelSU source incomplete - core_hook.c missing"
+    [[ -f "$KSU_KERNEL_SOURCE/ksu.c" ]] || die "KernelSU source incomplete - ksu.c missing"
 
     # Check symlink exists in kernel source
     local driver_dir
@@ -1455,6 +1510,47 @@ verify_integration() {
         fi
     fi
 
+    # Verify backports if enabled in full integration mode
+    if [[ $ANY_BACKPORT_SET -eq 1 ]]; then
+        local backport_errors=()
+
+        if [[ $BACKPORT_PATH_UMOUNT -eq 1 ]]; then
+            local ns_file="$KERNEL_SRC/$BACKPORT_PATH_UMOUNT_FILE"
+            if [[ -f "$ns_file" ]]; then
+                grep -q "$BACKPORT_PATH_UMOUNT_HOOK" "$ns_file" \
+                    || backport_errors+=("path_umount not found in $BACKPORT_PATH_UMOUNT_FILE")
+            else
+                backport_errors+=("$BACKPORT_PATH_UMOUNT_FILE not found")
+            fi
+        fi
+
+        if [[ $BACKPORT_DEVPTS -eq 1 ]]; then
+            local devpts_file="$KERNEL_SRC/$BACKPORT_DEVPTS_FILE"
+            if [[ -f "$devpts_file" ]]; then
+                grep -q "$BACKPORT_DEVPTS_HOOK" "$devpts_file" \
+                    || backport_errors+=("devpts hook not found in $BACKPORT_DEVPTS_FILE")
+            else
+                backport_errors+=("$BACKPORT_DEVPTS_FILE not found")
+            fi
+        fi
+
+        if [[ $BACKPORT_SAFE_MODE -eq 1 ]]; then
+            local input_file="$KERNEL_SRC/$BACKPORT_SAFE_MODE_FILE"
+            if [[ -f "$input_file" ]]; then
+                grep -q "$BACKPORT_SAFE_MODE_HOOK" "$input_file" \
+                    || backport_errors+=("safe_mode hook not found in $BACKPORT_SAFE_MODE_FILE")
+            else
+                backport_errors+=("$BACKPORT_SAFE_MODE_FILE not found")
+            fi
+        fi
+
+        if [[ ${#backport_errors[@]} -gt 0 ]]; then
+            die "Backport verification failed: ${backport_errors[*]}"
+        fi
+
+        log_success "Backport patches verified successfully"
+    fi
+
     log_success "Integration verified successfully"
 }
 
@@ -1472,7 +1568,7 @@ main() {
     # Standalone backport mode
     # Only apply the specified backport(s). Skip all other steps.
     # =========================================================================
-    if [[ $ANY_BACKPORT_SET -eq 1 ]]; then
+    if [[ "$METHOD" == "standalone" ]]; then
         log_step "Standalone backport mode: $(get_backport_list)"
 
         if [[ $BACKPORT_PATH_UMOUNT -eq 1 ]]; then
@@ -1519,6 +1615,20 @@ main() {
             ;;
     esac
 
+    # Apply backports if requested in full integration mode
+    if [[ $ANY_BACKPORT_SET -eq 1 ]]; then
+        log_step "Applying backport patches"
+        if [[ $BACKPORT_PATH_UMOUNT -eq 1 ]]; then
+            apply_backport_path_umount || die "path_umount backport failed"
+        fi
+        if [[ $BACKPORT_DEVPTS -eq 1 ]]; then
+            apply_backport_devpts || die "devpts backport failed"
+        fi
+        if [[ $BACKPORT_SAFE_MODE -eq 1 ]]; then
+            apply_backport_safe_mode || die "safe_mode backport failed"
+        fi
+    fi
+
     verify_integration
 
     log_step "Integration Complete"
@@ -1530,6 +1640,11 @@ main() {
 
     if [[ "$METHOD" == "manual" ]]; then
         log_info "  Backup files created: *.ksu-backup.* in each patched directory"
+    fi
+
+    if [[ $ANY_BACKPORT_SET -eq 1 ]]; then
+        log_info "  Backports applied: $(get_backport_list)"
+    else
         log_info "  Optional backports (run separately if needed):"
         log_info "    --backport-path_umount  (for 'Umount module' on pre-5.9 kernels)"
         log_info "    --backport-devpts       (fixes 'pm' execution in terminal)"

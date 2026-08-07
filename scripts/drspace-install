@@ -2,10 +2,10 @@
 """
 drspace-install — Install Droidspaces OSS kernel configurations.
 Usage:
-    ./drspace-install <kernel_source_path> <defconfig_rel_path> [--include-optional] [--skip-patch] [--dry-run]
+    ./drspace-install [<kernel_source_path>] <defconfig_rel_path> [--include-optional] [--skip-patch] [--dry-run]
 
 Arguments:
-    kernel_source_path : path to kernel source tree (contains Makefile)
+    kernel_source_path : path to kernel source tree (contains Makefile) (default: current working directory)
     defconfig_rel_path : path to defconfig relative to <kernel_source>/arch/arm64/configs
                          (e.g. vendor/lavender-perf_defconfig)
 
@@ -520,7 +520,7 @@ def main():
         description="Install Droidspaces OSS kernel configurations and patches.",
         formatter_class=argparse.RawTextHelpFormatter,
     )
-    parser.add_argument("kernel_source", type=str, help="Path to kernel source directory (contains Makefile)")
+    parser.add_argument("kernel_source", nargs='?', default='.', type=str, help="Path to kernel source directory (contains Makefile) (default: current working directory)")
     parser.add_argument("defconfig_path", type=str, help="Path to defconfig file relative to <kernel_source>/arch/arm64/configs (e.g. vendor/whyred-perf_defconfig)")
     parser.add_argument("--include-optional", action="store_true", help="Include optional configurations (UFW, Fail2ban, USER_NS, TMPFS_XATTR, TMPFS_POSIX_ACL, etc.)")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be done without making changes.")
@@ -528,7 +528,7 @@ def main():
     args = parser.parse_args()
 
     # Validate paths
-    src_path = Path(args.kernel_source)
+    src_path = Path(args.kernel_source).resolve()
     
     # Resolve defconfig_path relative to <kernel_source>/arch/arm64/configs
     defconfig_base = src_path / "arch" / "arm64" / "configs"

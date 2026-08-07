@@ -206,18 +206,38 @@ EOF
 # Command: clean
 # ============================================================================
 cmd_clean() {
-    local source_dir
-    local force=0
+    local preset=""
+    local source_dir=""
     local dry_run=0
 
-    # Parse arguments
+    # Parse arguments - first arg must be preset
+    if [[ $# -eq 0 ]]; then
+        show_clean_usage
+        die "Preset is required. Use 'full', 'skip-out', or 'boot'."
+    fi
+
+    # Handle help flag before preset validation
+    if [[ "$1" == "-h" || "$1" == "--help" ]]; then
+        show_clean_usage
+        exit 0
+    fi
+
+    preset="$1"
+    shift
+
+    # Validate preset
+    case "$preset" in
+        full|skip-out|boot)
+            ;;
+        *)
+            die "Invalid preset: '$preset'. Valid presets: full, skip-out, boot"
+            ;;
+    esac
+
+    # Parse remaining options
     local args=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --force|-f)
-                force=1
-                shift
-                ;;
             --dry-run)
                 dry_run=1
                 shift
@@ -239,32 +259,62 @@ cmd_clean() {
     source_dir="$(resolve_source_dir "${args[0]:-.}")"
     validate_kernel_source "$source_dir"
 
-    # Additional validation: ensure it's a git repo
+    # Additional validation: ensure it's a git repo (required for git operations)
     [[ -d "$source_dir/.git" ]] || die "Not a git repository: $source_dir"
 
-    log_step "Cleaning kernel source: $source_dir"
+    log_step "Cleaning kernel source: $source_dir (preset: $preset)"
     [[ $dry_run -eq 1 ]] && log_warn "DRY RUN - no changes will be made"
 
     cd "$source_dir"
 
     local operations=()
 
-    # 1. Remove out directory
-    if [[ -d "out" ]]; then
-        operations+=("rm -rf out")
-    fi
+    case "$preset" in
+        full)
+            # 1. Remove out directory
+            if [[ -d "out" ]]; then
+                operations+=("rm -rf out")
+            fi
 
-    # 2. git reset --hard
-    operations+=("git reset --hard")
+            # 2. git reset --hard
+            operations+=("git reset --hard")
 
-    # 3. git clean -f
-    operations+=("git clean -f")
+            # 3. git clean -f (remove untracked files)
+            operations+=("git clean -f")
 
-    # 4. git clean -xf
-    operations+=("git clean -xf")
+            # 4. git clean -xf (remove untracked files including those in .gitignore)
+            operations+=("git clean -xf")
 
-    # 5. git clean -Xf
-    operations+=("git clean -Xf")
+            # 5. git clean -Xf (remove ONLY ignored files)
+            operations+=("git clean -Xf")
+            ;;
+
+        skip-out)
+            # Full clean but WITHOUT removing out directory
+            # 1. git reset --hard
+            operations+=("git reset --hard")
+
+            # 2. git clean -f (remove untracked files)
+            operations+=("git clean -f")
+
+            # 3. git clean -xf (remove untracked files including those in .gitignore)
+            operations+=("git clean -xf")
+
+            # 4. git clean -Xf (remove ONLY ignored files)
+            # IMPORTANT: Use --exclude=out to prevent git clean from removing out/ dir
+            # since out/ is typically in .gitignore
+            operations+=("git clean -Xf --exclude=out")
+            ;;
+
+        boot)
+            # Remove only out/arch/arm64/boot
+            if [[ -d "out/arch/arm64/boot" ]]; then
+                operations+=("rm -rf out/arch/arm64/boot")
+            else
+                log_info "Directory out/arch/arm64/boot does not exist, nothing to clean"
+            fi
+            ;;
+    esac
 
     for op in "${operations[@]}"; do
         if [[ $dry_run -eq 1 ]]; then
@@ -280,29 +330,33 @@ cmd_clean() {
         fi
     done
 
-    [[ $dry_run -eq 0 ]] && log_success "Clean completed"
+    [[ $dry_run -eq 0 ]] && log_success "Clean completed ($preset)"
     return 0
 }
 
 show_clean_usage() {
     cat <<EOF
-Usage: ktool clean [source-dir] [options]
+Usage: ktool clean <preset> [source-dir] [options]
+
+Presets (required):
+  full         Full clean: removes out/, git reset --hard, git clean -f -xf -Xf
+  skip-out     Full clean but KEEP out/ dir: git reset --hard, git clean -f -xf -Xf (with --exclude=out)
+  boot         Remove only out/arch/arm64/boot
 
 Arguments:
-  source-dir           Path to kernel source (default: ./)
+  source-dir           Path to kernel source (default: current working directory)
 
 Options:
-  -f, --force          Force clean without confirmation (not implemented yet)
   --dry-run            Show what would be done without executing
   -h, --help           Show this help
 
 This command validates that the source directory is a valid kernel source tree
-and a git repository, then runs:
-  - rm -rf out (if exists)
-  - git reset --hard
-  - git clean -f
-  - git clean -xf
-  - git clean -Xf
+and a git repository.
+
+Examples:
+  ktool clean full
+  ktool clean skip-out ./kernel
+  ktool clean boot --dry-run
 EOF
 }
 
@@ -318,7 +372,7 @@ Usage: ktool <command> [args...] [options]
 Commands:
   defconfig-list [source-dir]        List defconfigs in source-dir/arch/arm64/configs
   ak3|make-flashable [source-dir]    Create flashable AnyKernel3 zip
-  clean [source-dir]                 Clean kernel source tree (git + out dir)
+  clean <preset> [source-dir]        Clean kernel source tree (preset: full, skip-out, boot)
 
 Global Options:
   -h, --help       Show this help
@@ -332,8 +386,9 @@ Examples:
   ktool defconfig-list ./my-kernel
   ktool ak3 ./kernel --template norm
   ktool make-flashable --zip-name my-release
-  ktool clean --dry-run
-  ktool clean ./kernel
+  ktool clean full
+  ktool clean skip-out ./kernel
+  ktool clean boot --dry-run
 EOF
 }
 
