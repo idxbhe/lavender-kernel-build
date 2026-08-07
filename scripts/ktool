@@ -1,0 +1,384 @@
+#!/usr/bin/env bash
+# ktool - Unified Kernel Development Toolkit
+# Robust, scalable base for kernel development commands
+#
+# Usage: ktool <command> [options]
+# Commands:
+#   defconfig-list [source-dir]        List defconfigs in source-dir/arch/arm64/configs
+#   ak3|make-flashable [source-dir]    Create flashable AnyKernel3 zip
+#   clean [source-dir]                 Clean kernel source tree
+#
+# Default source-dir is current working directory (not script directory)
+
+set -euo pipefail
+
+# ============================================================================
+# Constants & Configuration
+# ============================================================================
+readonly KTOOL_VERSION="1.0.0"
+readonly SCRIPT_NAME="$(basename "$0")"
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly BASE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+readonly TEMPLATES_DIR="$BASE_DIR/templates/AnyKernel3"
+readonly DEFAULT_TEMPLATE="norm"
+
+# ============================================================================
+# Logging & Output Functions
+# ============================================================================
+log_info()    { printf '\033[1;34m[INFO]\033[0m  %s\n' "$*"; }
+log_success() { printf '\033[1;32m[OK]\033[0m   %s\n' "$*"; }
+log_warn()    { printf '\033[1;33m[WARN]\033[0m  %s\n' "$*"; }
+log_error()   { printf '\033[1;31m[ERROR]\033[0m %s\n' "$*" >&2; }
+log_debug()   { [[ "${DEBUG:-0}" -eq 1 ]] && printf '\033[1;36m[DEBUG]\033[0m %s\n' "$*"; return 0; }
+log_step()    { printf '\n\033[1;35m>>> %s\033[0m\n' "$*"; }
+
+die() {
+    log_error "$*"
+    exit 1
+}
+
+# ============================================================================
+# Core Utilities
+# ============================================================================
+resolve_source_dir() {
+    local source_dir="${1:-.}"
+    if [[ "$source_dir" = "." ]]; then
+        # Default to current working directory, not BASE_DIR
+        source_dir="$PWD"
+    elif [[ ! "$source_dir" = /* ]]; then
+        source_dir="$BASE_DIR/$source_dir"
+    fi
+    source_dir="$(realpath "$source_dir" 2>/dev/null)" || die "Invalid source directory: $1"
+    echo "$source_dir"
+}
+
+validate_kernel_source() {
+    local source_dir="$1"
+    [[ -d "$source_dir" ]] || die "Source directory not found: $source_dir"
+    [[ -f "$source_dir/Makefile" && -f "$source_dir/Kconfig" ]] || die "Not a valid kernel source tree: $source_dir"
+}
+
+# ============================================================================
+# Command: defconfig-list
+# ============================================================================
+cmd_defconfig_list() {
+    # Handle help flag
+    [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { show_defconfig_list_usage; exit 0; }
+
+    local source_dir
+    source_dir="$(resolve_source_dir "${1:-.}")"
+
+    local configs_dir="$source_dir/arch/arm64/configs"
+    [[ -d "$configs_dir" ]] || die "Defconfigs directory not found: $configs_dir"
+
+    log_step "Listing defconfigs in $configs_dir"
+
+    if command -v tree >/dev/null 2>&1; then
+        # Use tree to list files only (flat), with relative paths, filter out directories
+        (cd "$configs_dir" && tree -f -i -F --noreport .) | sed 's|^\./||' | grep -v '/$' | grep -v '^$'
+    else
+        # Fallback: use find with relative paths
+        find "$configs_dir" -type f \( -name "*defconfig*" -o -name "*_defconfig" -o -name "*.config" \) | sort | while IFS= read -r file; do
+            printf '%s\n' "${file#$configs_dir/}"
+        done
+    fi
+}
+
+show_defconfig_list_usage() {
+    cat <<EOF
+Usage: ktool defconfig-list [source-dir]
+
+Arguments:
+  source-dir           Path to kernel source (default: current working directory)
+
+This command lists all defconfig files in source-dir/arch/arm64/configs/
+using 'tree -f' (or find as fallback).
+EOF
+}
+
+# ============================================================================
+# Command: ak3 / make-flashable
+# ============================================================================
+cmd_ak3() {
+    local source_dir
+    local template="$DEFAULT_TEMPLATE"
+    local zip_name=""
+
+    # Parse arguments
+    local args=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --template)
+                [[ -z "${2:-}" ]] && die "--template requires a value"
+                template="$2"
+                shift 2
+                ;;
+            --zip-name)
+                [[ -z "${2:-}" ]] && die "--zip-name requires a value"
+                zip_name="$2"
+                shift 2
+                ;;
+            -h|--help)
+                show_ak3_usage
+                exit 0
+                ;;
+            -*)
+                die "Unknown option for ak3: $1"
+                ;;
+            *)
+                args+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    source_dir="$(resolve_source_dir "${args[0]:-.}")"
+    validate_kernel_source "$source_dir"
+
+    # Validate template
+    local template_dir="$TEMPLATES_DIR/$template"
+    [[ -d "$template_dir" ]] || die "Template directory not found: $template_dir. Available: $(ls -1 "$TEMPLATES_DIR" 2>/dev/null | tr '\n' ' ')"
+
+    # Find kernel image
+    local image_src="$source_dir/out/arch/arm64/boot/Image.gz-dtb"
+    [[ -f "$image_src" ]] || die "Kernel image not found: $image_src (run kompile first)"
+
+    # Generate zip name if not provided
+    if [[ -z "$zip_name" ]]; then
+        local kernel_name
+        kernel_name="$(basename "$source_dir")"
+        local date_str
+        date_str="$(date +%Y%m%d-%H%M%S)"
+        zip_name="${kernel_name}-${template}-${date_str}"
+    fi
+
+    log_step "Creating AnyKernel3 flashable zip"
+    log_info "Source: $source_dir"
+    log_info "Template: $template"
+    log_info "Image: $image_src"
+    log_info "Output: $zip_name.zip"
+
+    # Create temporary directory
+    local temp_dir
+    temp_dir="$(mktemp -d -t ktool-ak3-XXXXXX)"
+    # Use a function for cleanup to avoid unbound variable issues
+    cleanup_temp_dir() {
+        [[ -n "${temp_dir:-}" && -d "$temp_dir" ]] && rm -rf "$temp_dir"
+    }
+    trap cleanup_temp_dir EXIT
+
+    # Copy template contents
+    cp -r "$template_dir"/* "$temp_dir/"
+
+    # Copy kernel image
+    cp "$image_src" "$temp_dir/"
+
+    # Ensure release directory exists
+    local release_dir="$BASE_DIR/release"
+    mkdir -p "$release_dir"
+
+    # Create zip
+    (cd "$temp_dir" && zip -r9 "$release_dir/${zip_name}.zip" . -x ".git" "README.md" "placeholder" >/dev/null)
+
+    log_success "Created: $release_dir/${zip_name}.zip"
+}
+
+show_ak3_usage() {
+    cat <<EOF
+Usage: ktool ak3|make-flashable [source-dir] [options]
+
+Arguments:
+  source-dir           Path to kernel source (default: ./)
+
+Options:
+  --template <name>    Template under templates/AnyKernel3/ (default: norm)
+  --zip-name <name>    Output zip name without .zip extension
+  -h, --help           Show this help
+
+Examples:
+  ktool ak3 ./kernel
+  ktool make-flashable --template special
+  ktool ak3 --zip-name my-kernel-release
+EOF
+}
+
+# ============================================================================
+# Command: clean
+# ============================================================================
+cmd_clean() {
+    local source_dir
+    local force=0
+    local dry_run=0
+
+    # Parse arguments
+    local args=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --force|-f)
+                force=1
+                shift
+                ;;
+            --dry-run)
+                dry_run=1
+                shift
+                ;;
+            -h|--help)
+                show_clean_usage
+                exit 0
+                ;;
+            -*)
+                die "Unknown option for clean: $1"
+                ;;
+            *)
+                args+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    source_dir="$(resolve_source_dir "${args[0]:-.}")"
+    validate_kernel_source "$source_dir"
+
+    # Additional validation: ensure it's a git repo
+    [[ -d "$source_dir/.git" ]] || die "Not a git repository: $source_dir"
+
+    log_step "Cleaning kernel source: $source_dir"
+    [[ $dry_run -eq 1 ]] && log_warn "DRY RUN - no changes will be made"
+
+    cd "$source_dir"
+
+    local operations=()
+
+    # 1. Remove out directory
+    if [[ -d "out" ]]; then
+        operations+=("rm -rf out")
+    fi
+
+    # 2. git reset --hard
+    operations+=("git reset --hard")
+
+    # 3. git clean -f
+    operations+=("git clean -f")
+
+    # 4. git clean -xf
+    operations+=("git clean -xf")
+
+    # 5. git clean -Xf
+    operations+=("git clean -Xf")
+
+    for op in "${operations[@]}"; do
+        if [[ $dry_run -eq 1 ]]; then
+            log_info "[DRY RUN] $op"
+        else
+            log_info "Running: $op"
+            # Use || true to prevent set -e from exiting on expected "failures"
+            if eval "$op" || true; then
+                log_success "Done: $op"
+            else
+                log_warn "Command failed (continuing): $op"
+            fi
+        fi
+    done
+
+    [[ $dry_run -eq 0 ]] && log_success "Clean completed"
+    return 0
+}
+
+show_clean_usage() {
+    cat <<EOF
+Usage: ktool clean [source-dir] [options]
+
+Arguments:
+  source-dir           Path to kernel source (default: ./)
+
+Options:
+  -f, --force          Force clean without confirmation (not implemented yet)
+  --dry-run            Show what would be done without executing
+  -h, --help           Show this help
+
+This command validates that the source directory is a valid kernel source tree
+and a git repository, then runs:
+  - rm -rf out (if exists)
+  - git reset --hard
+  - git clean -f
+  - git clean -xf
+  - git clean -Xf
+EOF
+}
+
+# ============================================================================
+# Main Command Dispatcher
+# ============================================================================
+show_global_usage() {
+    cat <<EOF
+ktool v$KTOOL_VERSION - Unified Kernel Development Toolkit
+
+Usage: ktool <command> [args...] [options]
+
+Commands:
+  defconfig-list [source-dir]        List defconfigs in source-dir/arch/arm64/configs
+  ak3|make-flashable [source-dir]    Create flashable AnyKernel3 zip
+  clean [source-dir]                 Clean kernel source tree (git + out dir)
+
+Global Options:
+  -h, --help       Show this help
+  -v, --version    Show version
+  --debug          Enable debug output
+
+Command-specific options: Use 'ktool <command> --help'
+
+Examples:
+  ktool defconfig-list
+  ktool defconfig-list ./my-kernel
+  ktool ak3 ./kernel --template norm
+  ktool make-flashable --zip-name my-release
+  ktool clean --dry-run
+  ktool clean ./kernel
+EOF
+}
+
+show_version() {
+    echo "ktool v$KTOOL_VERSION"
+}
+
+main() {
+    # Handle global flags first
+    case "${1:-}" in
+        -h|--help)
+            show_global_usage
+            exit 0
+            ;;
+        -v|--version)
+            show_version
+            exit 0
+            ;;
+        --debug)
+            export DEBUG=1
+            shift
+            ;;
+    esac
+
+    local command="${1:-}"
+    [[ -n "$command" ]] || { show_global_usage; die "No command specified"; }
+    shift
+
+    case "$command" in
+        defconfig-list)
+            cmd_defconfig_list "$@"
+            ;;
+        ak3|make-flashable)
+            cmd_ak3 "$@"
+            ;;
+        clean)
+            cmd_clean "$@"
+            ;;
+        *)
+            die "Unknown command: '$command'. Run 'ktool --help' for usage."
+            ;;
+    esac
+}
+
+# Execute main if script is run directly
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

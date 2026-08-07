@@ -2,3 +2,7 @@
 	path = external/KernelSU-Next
 	url = git@github.com:KernelSU-Next/KernelSU-Next.git
 	branch = legacy
+[submodule "external/KernelSU"]
+	path = external/KernelSU
+	url = https://github.com/tiann/KernelSU
+	branch = main
