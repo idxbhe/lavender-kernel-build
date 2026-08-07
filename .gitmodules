@@ -6,3 +6,6 @@
 	path = external/KernelSU
 	url = https://github.com/tiann/KernelSU
 	branch = main
+[submodule "external/Droidspaces-OSS"]
+	path = external/Droidspaces-OSS
+	url = git@github.com:ravindu644/Droidspaces-OSS.git
