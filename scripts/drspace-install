@@ -133,9 +133,9 @@ OPTIONAL_GKI = [
 ]
 
 # ==============================================
-#  PATCH RESOLUTION DATA (path relative to repo root / docs/...)
+#  PATCH RESOLUTION DATA (path relative to repo root / external/Droidspaces-OSS/Documentation/...)
 # ==============================================
-PATCH_DIR = Path(__file__).resolve().parent / "docs" / "Droidspaces-OSS" / "resources" / "kernel-patches"
+PATCH_DIR = Path(__file__).resolve().parent.parent / "external" / "Droidspaces-OSS" / "Documentation" / "resources" / "kernel-patches"
 
 PATCH_NON_GKI = [
     PATCH_DIR / "non-GKI" / "01.fix_kernel_panic_in_xt_qtaguid.patch",
