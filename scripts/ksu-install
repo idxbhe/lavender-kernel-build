@@ -28,6 +28,9 @@ readonly KSU_KERNEL_SOURCE="$KSU_SUBMODULE_PATH/kernel"
 
 # Options / Flags
 SKIP_KSU_FETCH=0
+SKIP_PATCHES=0
+INTEGRATE_COPY=0   # --integrate: copy KSU source into kernel tree instead of symlink
+CREATE_BACKUP=0    # --backup: create backup files before patching (default: no backup)
 BACKPORT_PATH_UMOUNT=0
 BACKPORT_DEVPTS=0
 BACKPORT_SAFE_MODE=0
@@ -35,15 +38,24 @@ BACKPORT_ALL=0
 ANY_BACKPORT_SET=0
 
 # Required kernel configs for kprobe method (KernelSU original)
+# CONFIG_OVERLAY_FS=y is required because the upstream KernelSU Kconfig declares
+# `depends on OVERLAY_FS` regardless of integration method. Without it,
+# `make defconfig` / `make olddefconfig` silently drops CONFIG_KSU=y (the
+# user-visible symptom: KSU never compiles, no `$(info -- KernelSU version: ...)`
+# log appears, no kernelsu.o is produced). The C code itself does not require
+# OVERLAY_FS, so this is purely a Kconfig-level dependency that we must satisfy.
 readonly KPROBE_CONFIGS=(
     "CONFIG_KPROBES=y"
     "CONFIG_HAVE_KPROBES=y"
     "CONFIG_KPROBE_EVENTS=y"
+    "CONFIG_OVERLAY_FS=y"
     "CONFIG_KSU=y"
 )
 
 # Required kernel configs for manual method
+# (same OVERLAY_FS=y rationale as KPROBE_CONFIGS above)
 readonly MANUAL_CONFIGS=(
+    "CONFIG_OVERLAY_FS=y"
     "CONFIG_KSU=y"
 )
 
@@ -124,6 +136,97 @@ find_next_line_matching() {
     ' "$file"
 }
 
+# parse_function_params FILE START_LINE
+#   Given the line where a function signature begins, return the comma-separated
+#   list of parameter NAMES (NOT types) on stdout, one per line. Handles the
+#   common C styles:
+#     static int foo(int a, struct bar *b, int c)
+#     int foo(int a,
+#             struct bar *b)
+#   Multi-line parameter lists are collected until the closing ')'.
+#   Pointer/array decorations are stripped so the bare identifier is returned.
+parse_function_params() {
+    local file="$1"
+    local start_line="$2"
+    awk -v start="$start_line" '
+        BEGIN { collecting = 0; params = ""; depth = 0; is_syscall = 0 }
+        NR < start { next }
+        {
+            line = $0
+            if (!collecting) {
+                # Detect the SYSCALL_DEFINE<N>(...) macro form, whose parameter
+                # list has the shape (name, type1, arg1, type2, arg2, ...) so the
+                # real argument names sit at every OTHER position (2nd, 4th, ...).
+                if (line ~ /SYSCALL_DEFINE[0-9]+\(/) is_syscall = 1
+                p = index(line, "(")
+                if (p == 0) next
+                rest = substr(line, p + 1)
+                collecting = 1
+                depth = 1
+            } else {
+                rest = line
+            }
+            i = 1
+            n = length(rest)
+            while (i <= n) {
+                c = substr(rest, i, 1)
+                if (c == "(") { depth++; params = params c }
+                else if (c == ")") {
+                    depth--
+                    if (depth == 0) {
+                        print_params(params, is_syscall)
+                        exit
+                    } else { params = params c }
+                } else {
+                    params = params c
+                }
+                i++
+            }
+        }
+        function print_params(s, syscall,   n, arr, i, p, name, j) {
+            n = split(s, arr, ",")
+            for (i = 1; i <= n; i++) {
+                p = arr[i]
+                sub(/^[ \t]*/, "", p)
+                sub(/[ \t]*$/, "", p)
+                if (syscall) {
+                    # Names are every OTHER token (2nd, 4th, 6th, ...) because the
+                    # shape is (name, type, arg, type, arg, ...). Skip the first
+                    # token (the syscall name) and then take odd positions.
+                    if (i == 1) continue
+                    if (i % 2 == 1) {
+                        name = p
+                        gsub(/^\*+/, "", name)
+                        if (name != "") print name
+                    }
+                    continue
+                }
+                # Normal C function: take the trailing identifier of each segment.
+                if (p ~ /[ \t*]/) {
+                    j = length(p)
+                    while (j > 0 && substr(p, j, 1) != " " && substr(p, j, 1) != "*") j--
+                    name = substr(p, j + 1)
+                } else { name = p }
+                gsub(/\[.*\]/, "", name)
+                gsub(/^\*+/, "", name)
+                if (name != "") print name
+            }
+        }
+    ' "$file"
+}
+
+# func_param_count FILE START_LINE  -> number of params
+func_param_count() {
+    local file="$1" start_line="$2"
+    parse_function_params "$file" "$start_line" | wc -l
+}
+
+# func_has_param FILE START_LINE NAME -> 0 if NAME is among the params, 1 if not
+func_has_param() {
+    local file="$1" start_line="$2" name="$3"
+    parse_function_params "$file" "$start_line" | grep -qx "$name"
+}
+
 insert_before_line() {
     local file="$1"
     local line_num="$2"
@@ -181,6 +284,13 @@ verify_patch_applied() {
 
 backup_and_verify() {
     local file="$1"
+
+    # If backups are disabled, return success without creating backup
+    if [[ $CREATE_BACKUP -eq 0 ]]; then
+        log_debug "Backup disabled, skipping backup for $file"
+        return 0
+    fi
+
     local backup_pattern="${file}.ksu-backup.*"
     local existing_backup
     existing_backup=$(ls -t ${backup_pattern} 2>/dev/null | head -1)
@@ -231,6 +341,24 @@ Arguments (Standalone Backport Mode):
 
 Options:
   --skip-ksu-fetch          Skip fetching/updating KernelSU submodule (use existing)
+  --skip-patchs             Skip the patch step (manual method patches and --backport-*
+                            patches). Only perform initial setup: KernelSU source
+                            fetch + symlink/Makefile/Kconfig + defconfig updates.
+                            Useful when you want to set up the KSU source tree first
+                            and apply patches in a later, separate run.
+  --integrate               Instead of creating a symlink at drivers/kernelsu ->
+                            external/KernelSU/kernel, COPY the KSU kernel source into
+                            the kernel tree as a real directory. Useful for kernel
+                            trees that are not part of the lavender repo (standalone
+                            builds, vendor kernel trees checked out for one-off
+                            compilation) where following a symlink back to a repo
+                            that does not exist would break the build. The KSU
+                            submodule is still fetched and pinned to the right tag
+                            ($KSU_TAG) so the copy contains the correct version;
+                            only the integration step (symlink -> copy) changes.
+  --backup                  Create backup files before patching kernel source files.
+                            By default, NO backup is created. Use this flag if you
+                            want .ksu-backup.* files for manual recovery.
 
 Backport Options (work in BOTH modes):
   --backport-path_umount    Backport path_umount from kernel 5.9 → fs/namespace.c
@@ -272,6 +400,19 @@ Examples:
   $SCRIPT_NAME kprobe /path/to/kernel vendor/lavender_defconfig
   $SCRIPT_NAME manual /path/to/kernel lavender_defconfig
 
+  # Setup only - fetch KSU source + update defconfig, skip patches (manual method)
+  $SCRIPT_NAME --skip-patchs manual lavender_defconfig
+  $SCRIPT_NAME --skip-patchs kprobe /path/to/kernel vendor/lavender_defconfig
+
+  # Full integration but COPY KernelSU source into the kernel tree instead of
+  # symlinking it. Use this for kernel trees that live outside the lavender repo.
+  $SCRIPT_NAME --integrate manual lavender_defconfig
+  $SCRIPT_NAME --integrate kprobe /path/to/standalone/kernel lavender_defconfig
+
+  # Setup only with explicit kernel source + backports skipped
+  $SCRIPT_NAME --skip-patchs --backport-devpts manual vendor/lavender_defconfig
+  # ^ will set up KSU source + defconfig, but skip the devpts backport patch
+
   # Full integration WITH backports (pre-5.9 kernels)
   $SCRIPT_NAME manual --backport-path_umount lavender_defconfig
   $SCRIPT_NAME kprobe /path/to/kernel vendor/lavender_defconfig --backport-path_umount --backport-devpts
@@ -304,6 +445,9 @@ validate_args() {
     for arg in "$@"; do
         case "$arg" in
             --skip-ksu-fetch) SKIP_KSU_FETCH=1 ;;
+            --skip-patchs) SKIP_PATCHES=1 ;;
+            --integrate) INTEGRATE_COPY=1 ;;
+            --backup) CREATE_BACKUP=1 ;;
             --backport-path_umount) has_backport_path_umount=1 ;;
             --backport-devpts) has_backport_devpts=1 ;;
             --backport-safe_mode|--backport-safe-mode) has_backport_safe_mode=1 ;;
@@ -411,6 +555,9 @@ validate_args() {
     log_debug "Kernel source: $KERNEL_SRC"
     log_debug "Defconfig: ${DEFCONFIG_PATH:-<none>}"
     log_debug "Skip KSU fetch: $SKIP_KSU_FETCH"
+    log_debug "Skip patches: $SKIP_PATCHES"
+    log_debug "Integrate (copy vs symlink): $INTEGRATE_COPY"
+    log_debug "Create backup: $CREATE_BACKUP"
     log_debug "Backport path_umount: $BACKPORT_PATH_UMOUNT"
     log_debug "Backport devpts: $BACKPORT_DEVPTS"
     log_debug "Backport safe_mode: $BACKPORT_SAFE_MODE"
@@ -442,6 +589,17 @@ check_prerequisites() {
     [[ -f "$KERNEL_SRC/Makefile" && -f "$KERNEL_SRC/Kconfig" ]] \
         || die "Not a valid kernel source tree: $KERNEL_SRC"
 
+    # KernelSU's Kconfig declares `depends on OVERLAY_FS`. If this kernel
+    # doesn't even have the OVERLAY_FS Kconfig symbol, we can't satisfy that
+    # dependency — warn the user loudly before they spend time building.
+    if [[ $ANY_BACKPORT_SET -eq 0 ]]; then
+        if ! grep -rq '^config OVERLAY_FS\b' "$KERNEL_SRC/fs/overlayfs/Kconfig" 2>/dev/null; then
+            log_warn "This kernel has no CONFIG_OVERLAY_FS Kconfig symbol (fs/overlayfs/Kconfig missing or empty)."
+            log_warn "KernelSU requires CONFIG_OVERLAY_FS=y. The KSU build will silently fail."
+            log_warn "Either: (a) enable OVERLAY_FS in your kernel source, or (b) patch the copied KSU Kconfig to remove 'depends on OVERLAY_FS'."
+        fi
+    fi
+
     # In standalone mode, verify target backport files exist
     if [[ $ANY_BACKPORT_SET -eq 1 ]]; then
         if [[ $BACKPORT_PATH_UMOUNT -eq 1 ]]; then
@@ -471,6 +629,13 @@ backup_file() {
 
 restore_backup() {
     local file="$1"
+
+    # If backups are disabled, nothing to restore
+    if [[ $CREATE_BACKUP -eq 0 ]]; then
+        log_debug "Backup disabled, skipping restore for $file"
+        return 0
+    fi
+
     local backup_pattern="${file}.ksu-backup.*"
     local latest_backup
     latest_backup=$(ls -t ${backup_pattern} 2>/dev/null | head -1)
@@ -655,26 +820,120 @@ integrate_ksu_into_kernel() {
     local driver_kconfig="$driver_dir/Kconfig"
     local kernelsu_symlink="$driver_dir/kernelsu"
 
-    # Compute relative path from driver_dir to KernelSU kernel source
+    # Compute relative path from driver_dir to KernelSU kernel source (used for
+    # the symlink fallback). With --integrate we copy instead of linking, so
+    # this is only relevant when INTEGRATE_COPY=0.
     local rel_path
     rel_path=$(realpath --relative-to="$(pwd)/$driver_dir" "$KSU_KERNEL_SOURCE")
 
-    # 1. Create/update symlink: drivers/kernelsu -> external/KernelSU/kernel
-    if [[ -L "$kernelsu_symlink" ]]; then
-        local current_target
-        current_target=$(readlink "$kernelsu_symlink")
-        if [[ "$current_target" != "$rel_path" ]]; then
-            log_info "Updating kernelsu symlink: $current_target -> $rel_path"
-            rm "$kernelsu_symlink"
-            ln -sf "$rel_path" "$kernelsu_symlink"
-        else
-            log_debug "kernelsu symlink already correct"
+    # 1. Create/update integration: symlink by default, real directory copy with
+    #    --integrate. The copy is a self-contained snapshot of $KSU_KERNEL_SOURCE
+    #    (the submodule, already pinned to $KSU_TAG) so the kernel tree does not
+    #    need external/KernelSU to exist at build time. We never silently
+    #    overwrite a non-empty directory we did not create: a marker file
+    #    (.ksu-integrated-copy) marks our own previous copies.
+    local ks_marker="$kernelsu_symlink/.ksu-integrated-copy"
+    if [[ $INTEGRATE_COPY -eq 1 ]]; then
+        # ---- copy mode ----
+        if [[ -L "$kernelsu_symlink" ]]; then
+            # Existing symlink (e.g. left over from a previous non-integrate run):
+            # remove it and replace with a real copy.
+            local old_target
+            old_target=$(readlink "$kernelsu_symlink")
+            log_info "Replacing existing symlink with copy (was -> $old_target)"
+            rm -f "$kernelsu_symlink"
+        elif [[ -d "$kernelsu_symlink" ]]; then
+            # Real directory. Refresh if it is one of our copies (marker present);
+            # refuse otherwise to protect unrelated content.
+            if [[ -f "$ks_marker" ]]; then
+                log_info "Refreshing previous KSU copy at $kernelsu_symlink"
+                rm -rf "$kernelsu_symlink"
+            else
+                die "$kernelsu_symlink already exists as a directory and is NOT a previous KSU copy (no .ksu-integrated-copy marker). Remove it manually or rename it to use --integrate."
+            fi
         fi
-    elif [[ -e "$kernelsu_symlink" ]]; then
-        die "$kernelsu_symlink exists but is not a symlink. Remove it manually first."
+
+        log_info "Copying KSU source into kernel tree ($kernelsu_symlink)"
+        # cp -a preserves attributes/ownership; --no-target-directory forces the
+        # destination to be treated as a directory even if the source has the
+        # same basename. We exclude the source's own .git directory if any
+        # (KernelSU kernel/ has none, but be defensive).
+        mkdir -p "$kernelsu_symlink"
+        cp -a "$KSU_KERNEL_SOURCE/." "$kernelsu_symlink/"
+        # Remove any git/submodule leftovers that might leak in (KernelSU
+        # kernel/ is plain C source, but the parent external/KernelSU is a git
+        # worktree, so any .git pointer would break the standalone build).
+        rm -rf "$kernelsu_symlink/.git"
+
+        # ---- Standalone-build fix: KSU_GIT_VERSION ----
+        # The KSU Makefile computes KSU_GIT_VERSION from `git rev-list --count HEAD`
+        # inside the source tree. In the symlink case that works because the build
+        # follows the symlink into external/KernelSU/ (a real git repo). In the
+        # --integrate/copy case the copy is not a git repo and there is no upstream
+        # override escape hatch, so the Makefile falls back to KSU_VERSION=16 and
+        # emits the warning "KSU_GIT_VERSION not defined! It is better to make
+        # KernelSU a git submodule!". Since the user explicitly does NOT want the
+        # submodule modified and the copied tree is not a repo, we patch the copied
+        # Makefile to hardcode the version computed from the submodule we just
+        # copied FROM (preserves the correct version, silences the warning, leaves
+        # the submodule untouched).
+        local ksu_makefile="$kernelsu_symlink/Makefile"
+        local ksu_count ksu_version
+        ksu_count=$(git -C "$KSU_SUBMODULE_PATH" rev-list --count HEAD 2>/dev/null || echo "")
+        if [[ -n "$ksu_count" && -f "$ksu_makefile" ]]; then
+            ksu_version=$((ksu_count + 10200))   # upstream formula: 10000 + count + 200
+            log_info "Patching copied KSU Makefile with hardcoded KSU_GIT_VERSION=$ksu_count (KSU_VERSION=$ksu_version)"
+            # Replace lines 19-30 (the ifeq/else/end block) with a clean hardcoded version.
+            # We do the replacement with awk to be robust to whitespace variations.
+            local tmp_mk
+            tmp_mk=$(mktemp)
+            awk -v count="$ksu_count" -v ver="$ksu_version" '
+                BEGIN { replaced = 0 }
+                # Match the start of the .git-detection block (the comment line)
+                /^# \.git is a text file while the module is imported by/ && !replaced {
+                    print "# Auto-generated by ksu-install --integrate: KSU_GIT_VERSION"
+                    print "# hardcoded because the kernel tree is standalone (no"
+                    print "# upstream escape hatch exists for non-submodule builds)."
+                    print "KSU_GIT_VERSION := " count
+                    print "KSU_VERSION := " ver
+                    print "$(info -- KernelSU version: $(KSU_VERSION))"
+                    print "ccflags-y += -DKSU_VERSION=$(KSU_VERSION)"
+                    replaced = 1
+                    # Skip until the matching "endif" of this block
+                    skip = 1
+                    next
+                }
+                skip && /^endif$/ { skip = 0; next }
+                skip { next }
+                { print }
+            ' "$ksu_makefile" > "$tmp_mk"
+            mv "$tmp_mk" "$ksu_makefile"
+            log_info "KSU Makefile patched (submodule left untouched)"
+        else
+            log_warn "Could not compute KSU_GIT_VERSION from submodule (count='$ksu_count'). Copy may build with fallback KSU_VERSION=16."
+        fi
+
+        # Drop the marker so we can detect this directory on later runs.
+        echo "Copied from $KSU_KERNEL_SOURCE at $(date -u +%FT%TZ)  KSU_VERSION=$ksu_version" > "$ks_marker"
+        log_info "KSU copy complete; marker written to $ks_marker"
     else
-        log_info "Creating kernelsu symlink -> $rel_path"
-        ln -sf "$rel_path" "$kernelsu_symlink"
+        # ---- symlink mode (default, unchanged behaviour) ----
+        if [[ -L "$kernelsu_symlink" ]]; then
+            local current_target
+            current_target=$(readlink "$kernelsu_symlink")
+            if [[ "$current_target" != "$rel_path" ]]; then
+                log_info "Updating kernelsu symlink: $current_target -> $rel_path"
+                rm "$kernelsu_symlink"
+                ln -sf "$rel_path" "$kernelsu_symlink"
+            else
+                log_debug "kernelsu symlink already correct"
+            fi
+        elif [[ -e "$kernelsu_symlink" ]]; then
+            die "$kernelsu_symlink exists but is not a symlink. Remove it manually first."
+        else
+            log_info "Creating kernelsu symlink -> $rel_path"
+            ln -sf "$rel_path" "$kernelsu_symlink"
+        fi
     fi
 
     # 2. Update drivers/Makefile: add obj-$(CONFIG_KSU) += kernelsu/
@@ -707,7 +966,11 @@ update_defconfig() {
     log_step "Updating defconfig: $(basename "$DEFCONFIG_PATH")"
 
     local backup
-    backup=$(backup_file "$DEFCONFIG_PATH")
+    if [[ $CREATE_BACKUP -eq 1 ]]; then
+        backup=$(backup_file "$DEFCONFIG_PATH")
+    else
+        log_debug "Backup disabled, skipping defconfig backup"
+    fi
 
     local modified=0
     for config in "${configs[@]}"; do
@@ -825,6 +1088,16 @@ patch_file_manual() {
 
 # --- Patch: fs/exec.c ---
 # KernelSU original: hooks do_execveat_common with dual hook (execveat + sucompat)
+#
+# Robustness: we parse the ACTUAL parameter names of do_execveat_common from the
+# source (they are not always fd/filename/argv/envp/flags across kernels) and use
+# those in the hook call. We also insert the call at the top of do_execveat_common's
+# body so every parameter is guaranteed to be in scope (the previous version
+# matched a "return do_execveat_common(...)" line that belonged to a *different*
+# function, e.g. do_execve, whose parameters did not include fd/flags -> undeclared
+# variable compile error). The hook is only emitted if all five expected
+# parameters exist in the signature; otherwise we fail loudly rather than emit
+# code referencing nonexistent variables.
 patch_exec_c() {
     local file="$1"
 
@@ -839,14 +1112,36 @@ patch_exec_c() {
     local indent
     indent=$(detect_indent "$file" 1)
 
-    # Find do_execveat_common function - try multiple patterns
+    # Find do_execveat_common function - try multiple patterns (kernels name it
+    # differently across versions: do_execveat_common, __do_execveat_common,
+    # do_execve_file, __do_execve_file).
     local execveat_line
     execveat_line=$(patch_with_fallback "$file" \
         '^[[:space:]]*static[[:space:]]+int[[:space:]]+do_execveat_common[[:space:]]*[(]' \
         '^[[:space:]]*int[[:space:]]+do_execveat_common[[:space:]]*[(]' \
-        '^[[:space:]]*static[[:space:]]+int[[:space:]]+__do_execveat_common[[:space:]]*[(]'
+        '^[[:space:]]*static[[:space:]]+int[[:space:]]+__do_execveat_common[[:space:]]*[(]' \
+        '^[[:space:]]*int[[:space:]]+__do_execveat_common[[:space:]]*[(]' \
+        '^[[:space:]]*static[[:space:]]+int[[:space:]]+do_execve_file[[:space:]]*[(]' \
+        '^[[:space:]]*int[[:space:]]+do_execve_file[[:space:]]*[(]' \
+        '^[[:space:]]*static[[:space:]]+int[[:space:]]+__do_execve_file[[:space:]]*[(]' \
+        '^[[:space:]]*int[[:space:]]+__do_execve_file[[:space:]]*[(]'
     )
     [[ -n "$execveat_line" ]] || { log_error "Could not find do_execveat_common in $file"; return 1; }
+
+    # Parse the real parameter names of do_execveat_common.
+    local params
+    params=$(parse_function_params "$file" "$execveat_line")
+    local p_fd p_filename p_argv p_envp p_flags
+    p_fd=$(printf '%s\n' "$params" | sed -n '1p')
+    p_filename=$(printf '%s\n' "$params" | sed -n '2p')
+    p_argv=$(printf '%s\n' "$params" | sed -n '3p')
+    p_envp=$(printf '%s\n' "$params" | sed -n '4p')
+    p_flags=$(printf '%s\n' "$params" | sed -n '5p')
+
+    if [[ -z "$p_fd" || -z "$p_filename" || -z "$p_argv" || -z "$p_envp" || -z "$p_flags" ]]; then
+        log_error "do_execveat_common in $file does not have the expected 5 parameters (got: $(echo "$params" | tr '\n' ' '))"
+        return 1
+    fi
 
     # Add extern declarations before do_execveat_common
     local extern_decl="${indent}#ifdef CONFIG_KSU
@@ -858,37 +1153,26 @@ ${indent}                                void *argv, void *envp, int *flags);
 ${indent}#endif"
     insert_before_line "$file" "$execveat_line" "$extern_decl"
 
-    # Find the return statement inside do_execveat_common
-    # Try __do_execve_file first (standard), then do_execveat_common (some kernels)
-    local return_patterns=(
-        'return[[:space:]]+__do_execve_file'
-        'return[[:space:]]+do_execve_file'
-        'return[[:space:]]+do_execveat_common'
-    )
-    local return_line
-    for pattern in "${return_patterns[@]}"; do
-        return_line=$(find_function_end "$file" "$execveat_line" "$pattern")
-        [[ -n "$return_line" ]] && break
-    done
-
-    if [[ -z "$return_line" ]]; then
-        # Fallback: find first return statement after function start
-        return_line=$(find_function_end "$file" "$execveat_line" 'return[[:space:]]')
-    fi
-
-    [[ -n "$return_line" ]] || { log_error "Could not find return statement in do_execveat_common"; return 1; }
+    # Insert the hook call at the TOP of do_execveat_common's body (right after its
+    # opening brace), so all five parameters are guaranteed in scope. Find the
+    # opening brace of this function (could be on the same line as the signature
+    # or on a following line).
+    local brace_line
+    brace_line=$(find_function_end "$file" "$execveat_line" '[{]')
+    [[ -n "$brace_line" ]] || { log_error "Could not find opening brace of do_execveat_common"; return 1; }
 
     local body_indent
-    body_indent=$(detect_indent "$file" "$return_line")
+    body_indent=$(detect_indent "$file" "$brace_line")
 
-    # Dual hook: ksu_handle_execveat OR ksu_handle_execveat_sucompat
+    # Dual hook: ksu_handle_execveat OR ksu_handle_execveat_sucompat, using the
+    # ACTUAL parameter names parsed from the function signature.
     local hook_call="${body_indent}#ifdef CONFIG_KSU
 ${body_indent}    if (unlikely(ksu_execveat_hook))
-${body_indent}        ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);
+${body_indent}        ksu_handle_execveat(&$p_fd, &$p_filename, &$p_argv, &$p_envp, &$p_flags);
 ${body_indent}    else
-${body_indent}        ksu_handle_execveat_sucompat(&fd, &filename, &argv, &envp, &flags);
+${body_indent}        ksu_handle_execveat_sucompat(&$p_fd, &$p_filename, &$p_argv, &$p_envp, &$p_flags);
 ${body_indent}#endif"
-    insert_before_line "$file" "$return_line" "$hook_call"
+    insert_after_line "$file" "$brace_line" "$hook_call"
 
     verify_patch_applied "$file" "ksu_handle_execveat" || { log_error "Patch verification failed for exec.c"; return 1; }
 
@@ -897,6 +1181,10 @@ ${body_indent}#endif"
 
 # --- Patch: fs/open.c ---
 # KernelSU original: hooks do_faccessat (or SYSCALL_DEFINE3(faccessat) for kernel < 4.17)
+#
+# Robustness: parse the ACTUAL parameter names of the located function (they vary
+# across kernels) and use them in the hook call instead of hardcoding
+# dfd/filename/mode. The hook is only emitted if the expected parameters exist.
 patch_open_c() {
     local file="$1"
 
@@ -922,6 +1210,20 @@ patch_open_c() {
     )
     [[ -n "$faccessat_line" ]] || { log_error "Could not find do_faccessat/faccessat syscall in $file"; return 1; }
 
+    # Parse the real parameter names. Expected shape:
+    #   do_faccessat(int dfd, const char __user *filename, int mode[, int flags])
+    # We need dfd (1st), filename (2nd), mode (3rd).
+    local params
+    params=$(parse_function_params "$file" "$faccessat_line")
+    local p_dfd p_filename p_mode
+    p_dfd=$(printf '%s\n' "$params" | sed -n '1p')
+    p_filename=$(printf '%s\n' "$params" | sed -n '2p')
+    p_mode=$(printf '%s\n' "$params" | sed -n '3p')
+    if [[ -z "$p_dfd" || -z "$p_filename" || -z "$p_mode" ]]; then
+        log_error "do_faccessat in $file does not have the expected parameters (got: $(echo "$params" | tr '\n' ' '))"
+        return 1
+    fi
+
     # Add extern declaration before the function
     local extern_decl="${indent}#ifdef CONFIG_KSU
 ${indent}extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode,
@@ -929,32 +1231,20 @@ ${indent}                        int *flags);
 ${indent}#endif"
     insert_before_line "$file" "$faccessat_line" "$extern_decl"
 
-    # Find the validation check - try multiple patterns
-    local check_patterns=(
-        'if[[:space:]]*[(][[:space:]]*mode[[:space:]]*&[[:space:]]*~S_IRWXO[[:space:]]*[)]'
-        'if[[:space:]]*[(][[:space:]]*mode[[:space:]]*&[[:space:]]*~0777[[:space:]]*[)]'
-        'if[[:space:]]*[(][[:space:]]*mode[[:space:]]*&[[:space:]]*~S_IRWXU[[:space:]]*[)]'
-    )
-    local check_line
-    for pattern in "${check_patterns[@]}"; do
-        check_line=$(find_function_end "$file" "$faccessat_line" "$pattern")
-        [[ -n "$check_line" ]] && break
-    done
-
-    if [[ -z "$check_line" ]]; then
-        # Fallback: find first if statement in function
-        check_line=$(find_function_end "$file" "$faccessat_line" '^[[:space:]]*if[[:space:]]*[(]')
-    fi
-
-    [[ -n "$check_line" ]] || { log_error "Could not find insertion point in do_faccessat"; return 1; }
+    # Insert the hook call at the TOP of the function body (right after its
+    # opening brace), where all parameters are in scope. This is more robust
+    # than trying to land it just before a specific validation 'if'.
+    local brace_line
+    brace_line=$(find_function_end "$file" "$faccessat_line" '[{]')
+    [[ -n "$brace_line" ]] || { log_error "Could not find opening brace of do_faccessat"; return 1; }
 
     local body_indent
-    body_indent=$(detect_indent "$file" "$check_line")
+    body_indent=$(detect_indent "$file" "$brace_line")
 
     local hook_call="${body_indent}#ifdef CONFIG_KSU
-${body_indent}    ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
+${body_indent}    ksu_handle_faccessat(&$p_dfd, &$p_filename, &$p_mode, NULL);
 ${body_indent}#endif"
-    insert_before_line "$file" "$check_line" "$hook_call"
+    insert_after_line "$file" "$brace_line" "$hook_call"
 
     verify_patch_applied "$file" "ksu_handle_faccessat" || { log_error "Patch verification failed for open.c"; return 1; }
 
@@ -963,6 +1253,10 @@ ${body_indent}#endif"
 
 # --- Patch: fs/read_write.c ---
 # KernelSU original: hooks vfs_read (NOT the syscall) with ksu_handle_vfs_read
+#
+# Robustness: parse the ACTUAL parameter names of vfs_read (they vary across
+# kernels: file/buf/count/pos is common but not universal) and use them in the
+# hook call. Only emit the hook if the four expected parameters exist.
 patch_read_write_c() {
     local file="$1"
 
@@ -986,6 +1280,20 @@ patch_read_write_c() {
     )
     [[ -n "$vfs_read_line" ]] || { log_error "Could not find vfs_read in $file"; return 1; }
 
+    # Parse the real parameter names. Expected: vfs_read(struct file *file,
+    # char __user *buf, size_t count, loff_t *pos)
+    local params
+    params=$(parse_function_params "$file" "$vfs_read_line")
+    local p_file p_buf p_count p_pos
+    p_file=$(printf '%s\n' "$params" | sed -n '1p')
+    p_buf=$(printf '%s\n' "$params" | sed -n '2p')
+    p_count=$(printf '%s\n' "$params" | sed -n '3p')
+    p_pos=$(printf '%s\n' "$params" | sed -n '4p')
+    if [[ -z "$p_file" || -z "$p_buf" || -z "$p_count" || -z "$p_pos" ]]; then
+        log_error "vfs_read in $file does not have the expected 4 parameters (got: $(echo "$params" | tr '\n' ' '))"
+        return 1
+    fi
+
     # Add extern declarations before vfs_read
     local extern_decl="${indent}#ifdef CONFIG_KSU
 ${indent}extern bool ksu_vfs_read_hook __read_mostly;
@@ -994,33 +1302,20 @@ ${indent}                       size_t *count_ptr, loff_t **pos);
 ${indent}#endif"
     insert_before_line "$file" "$vfs_read_line" "$extern_decl"
 
-    # Find ssize_t ret declaration directly from the function signature line.
-    # This handles both brace styles (brace on own line vs. same line as signature).
-    # If ssize_t ret is found, insert after it. Otherwise, insert after the
-    # first line containing '{' (the opening brace, regardless of position).
-    local ret_line
-    ret_line=$(find_function_end "$file" "$vfs_read_line" 'ssize_t[[:space:]]+ret')
-
-    local insert_target
-    if [[ -n "$ret_line" ]]; then
-        # Insert after ssize_t ret declaration
-        insert_target="$ret_line"
-    else
-        # Fallback: find the opening brace (on its own line or at end of a line)
-        local brace_line
-        brace_line=$(find_function_end "$file" "$vfs_read_line" '[{]')
-        [[ -n "$brace_line" ]] || { log_error "Could not find opening brace of vfs_read"; return 1; }
-        insert_target="$brace_line"
-    fi
+    # Insert the hook call at the TOP of vfs_read's body (after the opening brace),
+    # so all four parameters are guaranteed in scope.
+    local brace_line
+    brace_line=$(find_function_end "$file" "$vfs_read_line" '[{]')
+    [[ -n "$brace_line" ]] || { log_error "Could not find opening brace of vfs_read"; return 1; }
 
     local body_indent
-    body_indent=$(detect_indent "$file" "$insert_target")
+    body_indent=$(detect_indent "$file" "$brace_line")
 
     local hook_call="${body_indent}#ifdef CONFIG_KSU
 ${body_indent}    if (unlikely(ksu_vfs_read_hook))
-${body_indent}        ksu_handle_vfs_read(&file, &buf, &count, &pos);
+${body_indent}        ksu_handle_vfs_read(&$p_file, &$p_buf, &$p_count, &$p_pos);
 ${body_indent}#endif"
-    insert_after_line "$file" "$insert_target" "$hook_call"
+    insert_after_line "$file" "$brace_line" "$hook_call"
 
     verify_patch_applied "$file" "ksu_handle_vfs_read" || { log_error "Patch verification failed for read_write.c"; return 1; }
 
@@ -1029,6 +1324,12 @@ ${body_indent}#endif"
 
 # --- Patch: fs/stat.c ---
 # KernelSU original: hooks vfs_statx (or vfs_fstatat fallback for older kernels)
+#
+# Robustness: parse the ACTUAL parameter names of the located function. vfs_statx
+# and vfs_fstatat name their flags parameter differently (flags vs flag), and the
+# dfd/filename positions can vary, so we detect the flags parameter by name rather
+# than assuming a fixed position. The hook is only emitted if dfd, filename, and a
+# flags parameter all exist.
 patch_stat_c() {
     local file="$1"
 
@@ -1053,9 +1354,20 @@ patch_stat_c() {
     )
     [[ -n "$statx_line" ]] || { log_error "Could not find vfs_statx or vfs_fstatat in $file"; return 1; }
 
-    # Determine which function was found (affects variable name: flags vs flag)
-    local func_name
-    func_name=$(sed -n "${statx_line}p" "$file" | grep -oE 'vfs_statx|vfs_fstatat' | head -1)
+    # Parse the real parameter names.
+    #   vfs_statx(int dfd, const char __user *filename, int flags, ...)
+    #   vfs_fstatat(int dfd, const char __user *filename, struct kstat *stat, int flag)
+    # We need dfd (1st), filename (2nd), and the flags param (name contains "flag").
+    local params
+    params=$(parse_function_params "$file" "$statx_line")
+    local p_dfd p_filename p_flags
+    p_dfd=$(printf '%s\n' "$params" | sed -n '1p')
+    p_filename=$(printf '%s\n' "$params" | sed -n '2p')
+    p_flags=$(printf '%s\n' "$params" | grep -i 'flag' | head -1)
+    if [[ -z "$p_dfd" || -z "$p_filename" || -z "$p_flags" ]]; then
+        log_error "vfs_statx/vfs_fstatat in $file does not have dfd/filename/flags params (got: $(echo "$params" | tr '\n' ' '))"
+        return 1
+    fi
 
     # Add extern declaration before the function
     local extern_decl="${indent}#ifdef CONFIG_KSU
@@ -1063,44 +1375,19 @@ ${indent}extern int ksu_handle_stat(int *dfd, const char __user **filename_user,
 ${indent}#endif"
     insert_before_line "$file" "$statx_line" "$extern_decl"
 
-    # Find the error/validation check after the function opening
-    # vfs_statx uses 'flags', vfs_fstatat uses 'flag'
-    local check_patterns=(
-        'if[[:space:]]*[(][[:space:]]*[(]?[[:space:]]*flags[[:space:]]*&[[:space:]]*~'
-        'if[[:space:]]*[(][[:space:]]*[(]?[[:space:]]*flag[[:space:]]*&[[:space:]]*~'
-        'error[[:space:]]*=[[:space:]]*-EINVAL'
-        'int[[:space:]]+error[[:space:]]*='
-    )
-    local check_line
-    for pattern in "${check_patterns[@]}"; do
-        check_line=$(find_function_end "$file" "$statx_line" "$pattern")
-        [[ -n "$check_line" ]] && break
-    done
-
-    if [[ -z "$check_line" ]]; then
-        # Fallback: find opening brace (handles both brace-on-own-line and brace-on-same-line styles)
-        local brace_line
-        brace_line=$(find_function_end "$file" "$statx_line" '[{]')
-        if [[ -n "$brace_line" ]]; then
-            check_line=$((brace_line + 1))
-        else
-            check_line="$statx_line"
-        fi
-    fi
+    # Insert the hook call at the TOP of the function body (after the opening brace),
+    # where all parameters are in scope.
+    local brace_line
+    brace_line=$(find_function_end "$file" "$statx_line" '[{]')
+    [[ -n "$brace_line" ]] || { log_error "Could not find opening brace of vfs_statx/vfs_fstatat"; return 1; }
 
     local body_indent
-    body_indent=$(detect_indent "$file" "$check_line")
-
-    # Use appropriate variable name (flags for vfs_statx, flag for vfs_fstatat)
-    local var_name="flags"
-    if [[ "$func_name" == "vfs_fstatat" ]]; then
-        var_name="flag"
-    fi
+    body_indent=$(detect_indent "$file" "$brace_line")
 
     local hook_call="${body_indent}#ifdef CONFIG_KSU
-${body_indent}    ksu_handle_stat(&dfd, &filename, &${var_name});
+${body_indent}    ksu_handle_stat(&$p_dfd, &$p_filename, &$p_flags);
 ${body_indent}#endif"
-    insert_before_line "$file" "$check_line" "$hook_call"
+    insert_after_line "$file" "$brace_line" "$hook_call"
 
     verify_patch_applied "$file" "ksu_handle_stat" || { log_error "Patch verification failed for stat.c"; return 1; }
 
@@ -1113,65 +1400,155 @@ ${body_indent}#endif"
 
 # --- Backport 1: fs/namespace.c (path_umount from kernel 5.9) ---
 # Required for "Umount module" feature on kernels older than 5.9
+#
+# This is intentionally written to be robust across ALL kernel versions, not a
+# specific one. The strategy:
+#   1. Skip if already patched (our guarded block is present).
+#   2. Skip if the kernel already provides a native path_umount() (>= 5.9):
+#      injecting another one would cause a duplicate-symbol build error.
+#   3. Pick an insertion point from a priority list of anchors, every one of
+#      which is resolved to a line that is OUTSIDE any /* */ comment:
+#        a. after the '#endif' closing the 'may_mandlock' guard (5.x)
+#        b. after the 'Now umount can handle mount points' comment block closes
+#        c. immediately BEFORE SYSCALL_DEFINE2(umount, ...)  (universal anchor)
+#        d. after the closing brace of do_umount()
+#   4. Last resort: append at end of file (with a warning).
+#   5. Self-check: the whole file must have balanced /* */ comments afterwards
+#      and the injected #ifdef CONFIG_KSU must be outside any comment.
 patch_namespace_c() {
     local file="$1"
 
-    if verify_patch_applied "$file" "$BACKPORT_PATH_UMOUNT_HOOK"; then
-        log_debug "namespace.c already has $BACKPORT_PATH_UMOUNT_HOOK, skipping"
+    [[ -f "$file" ]] || { log_error "File not found: $file"; return 1; }
+
+    # Build a "comment map": for every line, emit "NR STATE RESTOFLINE" where
+    # STATE is 1 if the line STARTS inside a /* ... */ comment and 0 otherwise.
+    # This lets every anchor lookup be comment-aware (the bug we fixed: an anchor
+    # that lived inside a comment used to split that comment open).
+    local comment_map
+    comment_map=$(awk '
+        BEGIN { in_c = 0 }
+        {
+            line = $0
+            out = in_c
+            i = 1
+            n = length(line)
+            while (i <= n - 1) {
+                two = substr(line, i, 2)
+                if (in_c) {
+                    if (two == "*/") { in_c = 0; i += 2; continue }
+                } else {
+                    if (two == "/*") { in_c = 1; i += 2; continue }
+                }
+                i++
+            }
+            print NR " " out " " $0
+        }
+    ' "$file")
+
+    # --- helpers (operate on comment_map) ---
+    # First line (any comment state) matching ERE.
+    local _ln
+    ns_first()  { awk -v pat="$1" '$0 ~ pat { print $1; exit }' <<<"$comment_map"; }
+    # Is line L inside a comment? echoes 1/0.
+    ns_inside() { awk -v ln="$1" '$1 == ln { print $2; exit }' <<<"$comment_map"; }
+    # Line number of the '*/' that closes the comment containing line L.
+    ns_close()  {
+        awk -v start="$1" '
+            NR >= start {
+                if ($2 == 1 && /\*\//) { print NR; exit }
+            }
+        ' <<<"$comment_map"
+    }
+
+    # 1. Already patched? Our guarded block present => nothing to do.
+    if grep -q '#ifdef CONFIG_KSU' "$file" && grep -q "path_umount" "$file"; then
+        # Confirm the #ifdef is outside a comment (a real application).
+        local ksu_l
+        ksu_l=$(ns_first '#ifdef CONFIG_KSU')
+        if [[ -n "$ksu_l" && "$(ns_inside "$ksu_l")" == "0" ]]; then
+            log_info "namespace.c already has the KernelSU path_umount backport; skipping"
+            return 0
+        fi
+    fi
+
+    # 2. Native path_umount present (kernel >= 5.9)? Backport not needed.
+    if grep -q "path_umount" "$file" && ! grep -q '#ifdef CONFIG_KSU' "$file"; then
+        log_info "native path_umount() detected in namespace.c (kernel >= 5.9?); backport not required, skipping"
         return 0
     fi
 
-    local backup
-    backup=$(backup_and_verify "$file") || return 1
-
-    local indent
-    indent=$(detect_indent "$file" 1)
-
-    # Find insertion anchor: 'may_mandlock' function.
-    # The official patch places path_umount right after may_mandlock's
-    # '#endif' line, before the "Now umount can handle mount points" comment.
-    #
-    # Strategy:
-    #   1. Find 'may_mandlock' function start
-    #   2. Find the '#endif' line that closes the #if around may_mandlock
-    #   3. Insert the path_umount block right after that endif
-    #   Fallback: insert before the "Now umount" comment block
-    #   Last resort: append to end of file
-    #
-    # Note: We use awk directly (not patch_with_fallback) because may_mandlock
-    # is optional - its absence should trigger the fallback, not an error.
-
-    local may_mandlock_line
-    may_mandlock_line=$(awk '/may_mandlock/ { print NR; exit }' "$file")
-
+    # 3. Choose insertion point (priority order). Each must resolve to a line
+    #    that is OUTSIDE any comment.
     local insert_line=""
 
-    if [[ -n "$may_mandlock_line" ]]; then
-        # Find the first '#endif' after may_mandlock (closing its #if guard)
-        local endif_line
-        endif_line=$(awk -v start="$may_mandlock_line" '
-            NR > start && /^[[:space:]]*#endif/ { print NR; exit }
-        ' "$file")
-        if [[ -n "$endif_line" ]]; then
-            insert_line=$((endif_line + 1))
+    # 3a. After the '#endif' closing the may_mandlock guard.
+    local mandlock
+    mandlock=$(ns_first 'may_mandlock')
+    if [[ -n "$mandlock" && "$(ns_inside "$mandlock")" == "0" ]]; then
+        local endif_l
+        endif_l=$(awk -v start="$mandlock" '
+            NR > start && $2 == 0 && /^[[:space:]]*#endif/ { print $1; exit }
+        ' <<<"$comment_map")
+        if [[ -n "$endif_l" ]]; then
+            insert_line=$((endif_l + 1))
         fi
     fi
 
-    # Fallback: find the "Now umount" comment block and insert before it
+    # 3b. After the "Now umount can handle mount points" comment block closes.
     if [[ -z "$insert_line" ]]; then
-        local now_umount_line
-        now_umount_line=$(awk '/Now umount can handle mount points/ { print NR; exit }' "$file")
-        if [[ -n "$now_umount_line" ]]; then
-            insert_line="$now_umount_line"
+        local now_l
+        now_l=$(ns_first 'Now umount can handle mount points')
+        if [[ -n "$now_l" ]]; then
+            local close_l
+            close_l=$(ns_close "$now_l")
+            if [[ -n "$close_l" ]]; then
+                insert_line=$((close_l + 1))
+            fi
         fi
     fi
 
-    # Last-resort fallback: append to end of file
+    # 3c. Immediately BEFORE SYSCALL_DEFINE2(umount, ...) — universal anchor.
     if [[ -z "$insert_line" ]]; then
-        log_warn "Could not find may_mandlock anchor in namespace.c; appending path_umount at end of file"
+        local umount_l
+        umount_l=$(awk '$2 == 0 && $0 ~ /SYSCALL_DEFINE2\(umount/ { print $1; exit }' <<<"$comment_map")
+        if [[ -n "$umount_l" ]]; then
+            insert_line="$umount_l"   # insert BEFORE this line
+        fi
+    fi
+
+    # 3d. After the closing brace of do_umount().
+    if [[ -z "$insert_line" ]]; then
+        local do_l
+        do_l=$(awk '$2 == 0 && $0 ~ /^[a-zA-Z].*do_umount\(/ { print $1; exit }' <<<"$comment_map")
+        if [[ -n "$do_l" ]]; then
+            # Find the next top-level "}" after do_umount's opening brace.
+            local brace_l
+            brace_l=$(awk -v start="$do_l" '
+                NR > start && $2 == 0 && $0 ~ /^[[:space:]]*\}[[:space:]]*$/ { print $1; exit }
+            ' <<<"$comment_map")
+            if [[ -n "$brace_l" ]]; then
+                insert_line=$((brace_l + 1))
+            fi
+        fi
+    fi
+
+    # 3e. Last resort: append at end of file.
+    if [[ -z "$insert_line" ]]; then
+        log_warn "Could not find a safe anchor in namespace.c; appending path_umount at end of file"
         insert_line=$(wc -l < "$file")
         insert_line=$((insert_line + 1))
     fi
+
+    # Guard: never insert inside a comment. If somehow we did, bail.
+    if [[ "$(ns_inside "$insert_line")" == "1" ]]; then
+        log_error "Internal error: chosen insertion line $insert_line is inside a comment; aborting"
+        return 1
+    fi
+
+    # Use column-0 indentation to match KernelSU's published backport patch
+    # (preprocessor directives are conventionally at column 0; the inner body
+    # keeps KernelSU's documented 8-space indentation).
+    local indent=""
 
     # The path_umount backport block (verbatim from KernelSU original docs)
     local backport_block="${indent}#ifdef CONFIG_KSU
@@ -1212,6 +1589,48 @@ ${indent}#endif"
 
     insert_before_line "$file" "$insert_line" "$backport_block"
 
+    # 5. Self-check: the whole file must still have BALANCED /* */ comments.
+    # This is the strongest guard against the "split comment" class of bug.
+    local balance
+    balance=$(awk '
+        BEGIN { in_c = 0 }
+        {
+            line = $0; i = 1; n = length(line)
+            while (i <= n - 1) {
+                two = substr(line, i, 2)
+                if (in_c) { if (two == "*/") { in_c = 0; i += 2; continue } }
+                else { if (two == "/*") { in_c = 1; i += 2; continue } }
+                i++
+            }
+        }
+        END { print in_c }
+    ' "$file")
+    if [[ "$balance" != "0" ]]; then
+        log_error "Patch verification failed for namespace.c: comment balance is $balance (expected 0)"
+        return 1
+    fi
+
+    # And the injected #ifdef must be outside any comment.
+    local ksu_ifdef_line
+    ksu_ifdef_line=$(awk -v start="$insert_line" '
+        BEGIN { in_c = 0 }
+        NR >= start {
+            line = $0; i = 1; n = length(line)
+            while (i <= n - 1) {
+                two = substr(line, i, 2)
+                if (in_c) { if (two == "*/") { in_c = 0; i += 2; continue } }
+                else { if (two == "/*") { in_c = 1; i += 2; continue } }
+                i++
+            }
+            if (!in_c && $0 ~ /#ifdef CONFIG_KSU/) { print NR; exit }
+        }
+    ' "$file")
+    if [[ -z "$ksu_ifdef_line" ]]; then
+        log_error "Patch verification failed for namespace.c: injected CONFIG_KSU block is inside a comment"
+        return 1
+    fi
+
+    # And the canonical hook symbol must be reachable (outside comments).
     verify_patch_applied "$file" "$BACKPORT_PATH_UMOUNT_HOOK" \
         || { log_error "Patch verification failed for namespace.c (path_umount)"; return 1; }
 
@@ -1487,7 +1906,8 @@ verify_integration() {
     else
         die "Could not find drivers/ directory in kernel source"
     fi
-    [[ -L "$KERNEL_SRC/$driver_dir/kernelsu" ]] || die "kernelsu symlink missing in $driver_dir"
+    [[ -L "$KERNEL_SRC/$driver_dir/kernelsu" || -d "$KERNEL_SRC/$driver_dir/kernelsu" ]] \
+        || die "kernelsu integration missing in $driver_dir (expected symlink or --integrate copy)"
 
     # Check defconfig has CONFIG_KSU
     grep -q "^CONFIG_KSU=y" "$DEFCONFIG_PATH" || die "CONFIG_KSU not enabled in defconfig"
@@ -1499,56 +1919,64 @@ verify_integration() {
         done
     else
         # Verify patches applied by checking for hook calls (4 files)
-        local missing_hooks=()
-        grep -q "ksu_handle_execveat" "$KERNEL_SRC/fs/exec.c" || missing_hooks+=("exec.c")
-        grep -q "ksu_handle_faccessat" "$KERNEL_SRC/fs/open.c" || missing_hooks+=("open.c")
-        grep -q "ksu_handle_vfs_read" "$KERNEL_SRC/fs/read_write.c" || missing_hooks+=("read_write.c")
-        grep -q "ksu_handle_stat" "$KERNEL_SRC/fs/stat.c" || missing_hooks+=("stat.c")
+        if [[ $SKIP_PATCHES -eq 1 ]]; then
+            log_warn "Skipping manual patch verification (--skip-patchs)"
+        else
+            local missing_hooks=()
+            grep -q "ksu_handle_execveat" "$KERNEL_SRC/fs/exec.c" || missing_hooks+=("exec.c")
+            grep -q "ksu_handle_faccessat" "$KERNEL_SRC/fs/open.c" || missing_hooks+=("open.c")
+            grep -q "ksu_handle_vfs_read" "$KERNEL_SRC/fs/read_write.c" || missing_hooks+=("read_write.c")
+            grep -q "ksu_handle_stat" "$KERNEL_SRC/fs/stat.c" || missing_hooks+=("stat.c")
 
-        if [[ ${#missing_hooks[@]} -gt 0 ]]; then
-            die "Manual patches incomplete. Missing hooks in: ${missing_hooks[*]}"
+            if [[ ${#missing_hooks[@]} -gt 0 ]]; then
+                die "Manual patches incomplete. Missing hooks in: ${missing_hooks[*]}"
+            fi
         fi
     fi
 
     # Verify backports if enabled in full integration mode
     if [[ $ANY_BACKPORT_SET -eq 1 ]]; then
-        local backport_errors=()
+        if [[ $SKIP_PATCHES -eq 1 ]]; then
+            log_warn "Skipping backport verification (--skip-patchs)"
+        else
+            local backport_errors=()
 
-        if [[ $BACKPORT_PATH_UMOUNT -eq 1 ]]; then
-            local ns_file="$KERNEL_SRC/$BACKPORT_PATH_UMOUNT_FILE"
-            if [[ -f "$ns_file" ]]; then
-                grep -q "$BACKPORT_PATH_UMOUNT_HOOK" "$ns_file" \
-                    || backport_errors+=("path_umount not found in $BACKPORT_PATH_UMOUNT_FILE")
-            else
-                backport_errors+=("$BACKPORT_PATH_UMOUNT_FILE not found")
+            if [[ $BACKPORT_PATH_UMOUNT -eq 1 ]]; then
+                local ns_file="$KERNEL_SRC/$BACKPORT_PATH_UMOUNT_FILE"
+                if [[ -f "$ns_file" ]]; then
+                    grep -q "$BACKPORT_PATH_UMOUNT_HOOK" "$ns_file" \
+                        || backport_errors+=("path_umount not found in $BACKPORT_PATH_UMOUNT_FILE")
+                else
+                    backport_errors+=("$BACKPORT_PATH_UMOUNT_FILE not found")
+                fi
             fi
-        fi
 
-        if [[ $BACKPORT_DEVPTS -eq 1 ]]; then
-            local devpts_file="$KERNEL_SRC/$BACKPORT_DEVPTS_FILE"
-            if [[ -f "$devpts_file" ]]; then
-                grep -q "$BACKPORT_DEVPTS_HOOK" "$devpts_file" \
-                    || backport_errors+=("devpts hook not found in $BACKPORT_DEVPTS_FILE")
-            else
-                backport_errors+=("$BACKPORT_DEVPTS_FILE not found")
+            if [[ $BACKPORT_DEVPTS -eq 1 ]]; then
+                local devpts_file="$KERNEL_SRC/$BACKPORT_DEVPTS_FILE"
+                if [[ -f "$devpts_file" ]]; then
+                    grep -q "$BACKPORT_DEVPTS_HOOK" "$devpts_file" \
+                        || backport_errors+=("devpts hook not found in $BACKPORT_DEVPTS_FILE")
+                else
+                    backport_errors+=("$BACKPORT_DEVPTS_FILE not found")
+                fi
             fi
-        fi
 
-        if [[ $BACKPORT_SAFE_MODE -eq 1 ]]; then
-            local input_file="$KERNEL_SRC/$BACKPORT_SAFE_MODE_FILE"
-            if [[ -f "$input_file" ]]; then
-                grep -q "$BACKPORT_SAFE_MODE_HOOK" "$input_file" \
-                    || backport_errors+=("safe_mode hook not found in $BACKPORT_SAFE_MODE_FILE")
-            else
-                backport_errors+=("$BACKPORT_SAFE_MODE_FILE not found")
+            if [[ $BACKPORT_SAFE_MODE -eq 1 ]]; then
+                local input_file="$KERNEL_SRC/$BACKPORT_SAFE_MODE_FILE"
+                if [[ -f "$input_file" ]]; then
+                    grep -q "$BACKPORT_SAFE_MODE_HOOK" "$input_file" \
+                        || backport_errors+=("safe_mode hook not found in $BACKPORT_SAFE_MODE_FILE")
+                else
+                    backport_errors+=("$BACKPORT_SAFE_MODE_FILE not found")
+                fi
             fi
-        fi
 
-        if [[ ${#backport_errors[@]} -gt 0 ]]; then
-            die "Backport verification failed: ${backport_errors[*]}"
-        fi
+            if [[ ${#backport_errors[@]} -gt 0 ]]; then
+                die "Backport verification failed: ${backport_errors[*]}"
+            fi
 
-        log_success "Backport patches verified successfully"
+            log_success "Backport patches verified successfully"
+        fi
     fi
 
     log_success "Integration verified successfully"
@@ -1585,7 +2013,9 @@ main() {
 
         log_step "Integration Complete"
         log_success "Backport patches applied: $(get_backport_list)"
-        log_info "Backup files created: *.ksu-backup.* in patched directories"
+        if [[ $CREATE_BACKUP -eq 1 ]]; then
+            log_info "Backup files created: *.ksu-backup.* in patched directories"
+        fi
         log_info "Next steps:"
         log_info "  1. Build your kernel: make -C $KERNEL_SRC"
         log_info "  2. Flash the resulting boot.img"
@@ -1611,21 +2041,29 @@ main() {
             log_step "Configuring defconfig for manual method"
             update_defconfig "CONFIG_KPROBES=n" "CONFIG_HAVE_KPROBES=n" "CONFIG_KPROBE_EVENTS=n"
             update_defconfig "${MANUAL_CONFIGS[@]}"
-            apply_manual_patches
+            if [[ $SKIP_PATCHES -eq 1 ]]; then
+                log_warn "--skip-patchs specified: skipping manual integration patches (4 fs/*.c files)"
+            else
+                apply_manual_patches
+            fi
             ;;
     esac
 
     # Apply backports if requested in full integration mode
     if [[ $ANY_BACKPORT_SET -eq 1 ]]; then
-        log_step "Applying backport patches"
-        if [[ $BACKPORT_PATH_UMOUNT -eq 1 ]]; then
-            apply_backport_path_umount || die "path_umount backport failed"
-        fi
-        if [[ $BACKPORT_DEVPTS -eq 1 ]]; then
-            apply_backport_devpts || die "devpts backport failed"
-        fi
-        if [[ $BACKPORT_SAFE_MODE -eq 1 ]]; then
-            apply_backport_safe_mode || die "safe_mode backport failed"
+        if [[ $SKIP_PATCHES -eq 1 ]]; then
+            log_warn "--skip-patchs specified: skipping backport patches ($(get_backport_list))"
+        else
+            log_step "Applying backport patches"
+            if [[ $BACKPORT_PATH_UMOUNT -eq 1 ]]; then
+                apply_backport_path_umount || die "path_umount backport failed"
+            fi
+            if [[ $BACKPORT_DEVPTS -eq 1 ]]; then
+                apply_backport_devpts || die "devpts backport failed"
+            fi
+            if [[ $BACKPORT_SAFE_MODE -eq 1 ]]; then
+                apply_backport_safe_mode || die "safe_mode backport failed"
+            fi
         fi
     fi
 
@@ -1633,13 +2071,20 @@ main() {
 
     log_step "Integration Complete"
     log_success "KernelSU (original, tag: $KSU_TAG) integrated using '$METHOD' method"
+    if [[ $SKIP_PATCHES -eq 1 ]]; then
+        log_warn "Patches were SKIPPED (--skip-patchs). Source tree is ready, but hooks are NOT applied yet."
+        log_info "Re-run without --skip-patchs to apply the patches:"
+        log_info "  $SCRIPT_NAME $METHOD $KERNEL_SRC $(basename "$DEFCONFIG_PATH" 2>/dev/null || echo '<defconfig>')"
+    fi
     log_info "Next steps:"
     log_info "  1. Build your kernel: make -C $KERNEL_SRC $(basename "$DEFCONFIG_PATH") && make -C $KERNEL_SRC"
     log_info "  2. Flash the resulting boot.img"
     log_info "  3. If using kprobe and bootloops: kprobe is broken, use 'manual' method instead"
 
     if [[ "$METHOD" == "manual" ]]; then
-        log_info "  Backup files created: *.ksu-backup.* in each patched directory"
+        if [[ $CREATE_BACKUP -eq 1 ]]; then
+            log_info "  Backup files created: *.ksu-backup.* in each patched directory"
+        fi
     fi
 
     if [[ $ANY_BACKPORT_SET -eq 1 ]]; then
