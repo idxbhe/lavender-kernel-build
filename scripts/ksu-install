@@ -136,6 +136,105 @@ find_next_line_matching() {
     ' "$file"
 }
 
+# find_after_declarations FILE START_LINE
+#   Scan lines from START_LINE+1 (typically the line after a function's opening
+#   brace) and return the line number where the first *executable statement*
+#   begins (i.e. the line just AFTER all local declarations).
+#
+#   Why this exists: clang with -Werror,-Wdeclaration-after-statement (which is
+#   the default for Android kernel builds via scripts/kompile) refuses any
+#   statement that is followed by a declaration. If we insert a hook call at
+#   the top of a function body and the function then declares local variables
+#   afterwards, the kernel file fails to compile with
+#       error: mixing declarations and code is a C99 extension
+#              [-Werror,-Wdeclaration-after-statement]
+#   Solution: insert the hook call AFTER all the local declarations, i.e. at
+#   the position where execution would otherwise begin. This matches the
+#   original upstream KernelSU patch placement and is always safe.
+#
+#   Heuristic: a line is treated as a declaration if it
+#     - is empty or contains only a comment, OR
+#     - ends with ';' and matches the shape `^\s*(<type-specifiers>)* <name>\s*(=...)?\s*;`
+#       where the type-specifiers include the common C storage/type keywords
+#       (const, static, unsigned, signed, struct/union/enum tags handled via
+#       leading identifier tokens, plus plain int/char/long/etc.).
+#   We scan until we find a line that is NOT a declaration; that line is the
+#   first executable statement. Return its line number so the caller can
+#   insert_before_line it (so the hook lands at the end of the declaration
+#   block).
+find_after_declarations() {
+    local file="$1"
+    local start_line="$2"
+    awk -v start="$start_line" '
+        NR <= start { next }
+        {
+            line = $0
+            # Trim leading/trailing whitespace for classification
+            t = line
+            sub(/^[ \t]+/, "", t)
+            sub(/[ \t]+$/, "", t)
+            if (t == "") next                  # blank line: keep scanning
+            if (t ~ /^\/\// || t ~ /^\/\*/) next # full-line comment: keep scanning
+            if (t !~ /;$/) { print NR; exit }  # no trailing semicolon => statement
+            # Lines ending with ; could be declarations OR statement-expressions
+            # (e.g. function call). Heuristic: if the part before the FIRST
+            # identifier token (after stripping common leading type keywords)
+            # contains a known statement keyword, treat as statement.
+            low = tolower(t)
+            # Strip common leading type/storage keywords
+            while (low ~ /^(const|static|volatile|unsigned|signed|register|inline|extern)[[:space:]]+/) {
+                sub(/^(const|static|volatile|unsigned|signed|register|inline|extern)[[:space:]]+/, "", low)
+            }
+            # Struct/union/enum tag prefix like "struct foo "
+            if (low ~ /^(struct|union|enum)[[:space:]]+[a-zA-Z_][a-zA-Z0-9_]*[[:space:]]+/) {
+                sub(/^(struct|union|enum)[[:space:]]+[a-zA-Z_][a-zA-Z0-9_]*[[:space:]]+/, "", low)
+            }
+            # Now low starts with the canonical C type: int, char, long, short,
+            # void, float, double, _Bool, bool, u8/u16/u32/u64, s8/..., __u8...,
+            # or a custom typedef name (alphabetic). Then comes the variable
+            # name (possibly with *). After that comes either = initializer or
+            # , or nothing before the ;
+            #
+            # If low begins with a statement keyword, treat as statement.
+            if (low ~ /^(if|for|while|switch|return|goto|do|break|continue)[[:space:]]+/) {
+                print NR; exit
+            }
+            # If the line contains a function-call-like "name(" before any "="
+            # after the type, AND the whole line is not a plain
+            # "type var;" declaration, treat as statement.
+            # Simple detection: if "=" is present with something that does not
+            # look like a numeric/string literal/identifier on the RHS, AND the
+            # RHS contains "(" we call it a statement-expression.
+            # Otherwise: declaration.
+            #
+            # Conservative rule: if the line ends with ");" and contains "("
+            # (a function call) AND the token before "(" is NOT followed by
+            # "*" (a pointer-decl), call it a statement.
+            if (t ~ /\([^;]*\);$/) {
+                # function-call-like; but it could also be a cast/init like
+                # struct foo x = (struct foo){...};. Defer: if the RHS after
+                # the FIRST identifier+whitespace chunk does NOT contain "=",
+                # it is a pure function call statement.
+                # Simpler: if no "=" appears in the line, this is a call.
+                if (t !~ /=/ ) { print NR; exit }
+                # Has "=" -- check whether the LHS before "=" looks like
+                # "<type> <varname>" (declaration) vs something else.
+                # Crude check: count "=" before any "==" or ">=". If exactly
+                # one "=" and the part before is "type var", declaration.
+                n_eq = gsub(/=/, "=", line)
+                if (n_eq == 1) {
+                    # declaration-with-init: type var = expr;
+                    next   # keep scanning
+                }
+                # Multiple "=" or odd pattern -> treat as statement
+                print NR; exit
+            }
+            # Ends with ;, no call-shape, no statement keyword -> declaration
+            next
+        }
+    ' "$file"
+}
+
 # parse_function_params FILE START_LINE
 #   Given the line where a function signature begins, return the comma-separated
 #   list of parameter NAMES (NOT types) on stdout, one per line. Handles the
@@ -1153,13 +1252,20 @@ ${indent}                                void *argv, void *envp, int *flags);
 ${indent}#endif"
     insert_before_line "$file" "$execveat_line" "$extern_decl"
 
-    # Insert the hook call at the TOP of do_execveat_common's body (right after its
-    # opening brace), so all five parameters are guaranteed in scope. Find the
-    # opening brace of this function (could be on the same line as the signature
-    # or on a following line).
+    # Insert the hook call at the first executable statement of
+    # do_execveat_common (after all local declarations), so all five parameters
+    # are in scope AND the placement does not violate
+    # -Werror,-Wdeclaration-after-statement under clang. Naively placing the
+    # hook right after the opening brace would fail to compile on kernels built
+    # with clang when the function declares local variables immediately after
+    # the brace.
     local brace_line
     brace_line=$(find_function_end "$file" "$execveat_line" '[{]')
     [[ -n "$brace_line" ]] || { log_error "Could not find opening brace of do_execveat_common"; return 1; }
+
+    local first_stmt_line
+    first_stmt_line=$(find_after_declarations "$file" "$brace_line")
+    [[ -n "$first_stmt_line" ]] || first_stmt_line=$((brace_line + 1))
 
     local body_indent
     body_indent=$(detect_indent "$file" "$brace_line")
@@ -1172,7 +1278,7 @@ ${body_indent}        ksu_handle_execveat(&$p_fd, &$p_filename, &$p_argv, &$p_en
 ${body_indent}    else
 ${body_indent}        ksu_handle_execveat_sucompat(&$p_fd, &$p_filename, &$p_argv, &$p_envp, &$p_flags);
 ${body_indent}#endif"
-    insert_after_line "$file" "$brace_line" "$hook_call"
+    insert_before_line "$file" "$first_stmt_line" "$hook_call"
 
     verify_patch_applied "$file" "ksu_handle_execveat" || { log_error "Patch verification failed for exec.c"; return 1; }
 
@@ -1231,12 +1337,19 @@ ${indent}                        int *flags);
 ${indent}#endif"
     insert_before_line "$file" "$faccessat_line" "$extern_decl"
 
-    # Insert the hook call at the TOP of the function body (right after its
-    # opening brace), where all parameters are in scope. This is more robust
-    # than trying to land it just before a specific validation 'if'.
+    # Insert the hook call at the first executable statement of the function
+    # body (after all local declarations), so all parameters are in scope AND
+    # the placement does not violate -Werror,-Wdeclaration-after-statement
+    # under clang. Naively placing the hook right after the opening brace
+    # would fail to compile on kernels built with clang when the function
+    # declares local variables immediately after the brace.
     local brace_line
     brace_line=$(find_function_end "$file" "$faccessat_line" '[{]')
     [[ -n "$brace_line" ]] || { log_error "Could not find opening brace of do_faccessat"; return 1; }
+
+    local first_stmt_line
+    first_stmt_line=$(find_after_declarations "$file" "$brace_line")
+    [[ -n "$first_stmt_line" ]] || first_stmt_line=$((brace_line + 1))
 
     local body_indent
     body_indent=$(detect_indent "$file" "$brace_line")
@@ -1244,7 +1357,7 @@ ${indent}#endif"
     local hook_call="${body_indent}#ifdef CONFIG_KSU
 ${body_indent}    ksu_handle_faccessat(&$p_dfd, &$p_filename, &$p_mode, NULL);
 ${body_indent}#endif"
-    insert_after_line "$file" "$brace_line" "$hook_call"
+    insert_before_line "$file" "$first_stmt_line" "$hook_call"
 
     verify_patch_applied "$file" "ksu_handle_faccessat" || { log_error "Patch verification failed for open.c"; return 1; }
 
@@ -1302,11 +1415,20 @@ ${indent}                       size_t *count_ptr, loff_t **pos);
 ${indent}#endif"
     insert_before_line "$file" "$vfs_read_line" "$extern_decl"
 
-    # Insert the hook call at the TOP of vfs_read's body (after the opening brace),
-    # so all four parameters are guaranteed in scope.
+    # Insert the hook call at the first executable statement of vfs_read's
+    # body (after all local declarations), so all four parameters are in
+    # scope AND the placement does not violate
+    # -Werror,-Wdeclaration-after-statement under clang. Naively placing the
+    # hook right after the opening brace would fail to compile on kernels
+    # built with clang when the function declares local variables immediately
+    # after the brace.
     local brace_line
     brace_line=$(find_function_end "$file" "$vfs_read_line" '[{]')
     [[ -n "$brace_line" ]] || { log_error "Could not find opening brace of vfs_read"; return 1; }
+
+    local first_stmt_line
+    first_stmt_line=$(find_after_declarations "$file" "$brace_line")
+    [[ -n "$first_stmt_line" ]] || first_stmt_line=$((brace_line + 1))
 
     local body_indent
     body_indent=$(detect_indent "$file" "$brace_line")
@@ -1315,7 +1437,7 @@ ${indent}#endif"
 ${body_indent}    if (unlikely(ksu_vfs_read_hook))
 ${body_indent}        ksu_handle_vfs_read(&$p_file, &$p_buf, &$p_count, &$p_pos);
 ${body_indent}#endif"
-    insert_after_line "$file" "$brace_line" "$hook_call"
+    insert_before_line "$file" "$first_stmt_line" "$hook_call"
 
     verify_patch_applied "$file" "ksu_handle_vfs_read" || { log_error "Patch verification failed for read_write.c"; return 1; }
 
@@ -1375,11 +1497,19 @@ ${indent}extern int ksu_handle_stat(int *dfd, const char __user **filename_user,
 ${indent}#endif"
     insert_before_line "$file" "$statx_line" "$extern_decl"
 
-    # Insert the hook call at the TOP of the function body (after the opening brace),
-    # where all parameters are in scope.
+    # Insert the hook call at the first executable statement of the function
+    # body (after all local declarations), so all parameters are in scope AND
+    # the placement does not violate -Werror,-Wdeclaration-after-statement
+    # under clang. Naively placing the hook right after the opening brace
+    # would fail to compile on kernels built with clang when the function
+    # declares local variables immediately after the brace.
     local brace_line
     brace_line=$(find_function_end "$file" "$statx_line" '[{]')
     [[ -n "$brace_line" ]] || { log_error "Could not find opening brace of vfs_statx/vfs_fstatat"; return 1; }
+
+    local first_stmt_line
+    first_stmt_line=$(find_after_declarations "$file" "$brace_line")
+    [[ -n "$first_stmt_line" ]] || first_stmt_line=$((brace_line + 1))
 
     local body_indent
     body_indent=$(detect_indent "$file" "$brace_line")
@@ -1387,7 +1517,7 @@ ${indent}#endif"
     local hook_call="${body_indent}#ifdef CONFIG_KSU
 ${body_indent}    ksu_handle_stat(&$p_dfd, &$p_filename, &$p_flags);
 ${body_indent}#endif"
-    insert_after_line "$file" "$brace_line" "$hook_call"
+    insert_before_line "$file" "$first_stmt_line" "$hook_call"
 
     verify_patch_applied "$file" "ksu_handle_stat" || { log_error "Patch verification failed for stat.c"; return 1; }
 
