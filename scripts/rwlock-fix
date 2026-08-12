@@ -1,62 +1,304 @@
 #!/bin/bash
 # rwlock-fix: Fix mixed rwlock/rwsem usage in mm/vmscan.c
-# Usage: rwlock-fix [path to source kernel folder]
+#
+# Some vendor kernels ship a half-backported shrinker list that is declared
+# with DEFINE_RWLOCK but locked/unlocked with rwsem APIs (down_read/up_write
+# etc.). This script rewrites the declaration to DECLARE_RWSEM and converts
+# every lock/unlock call site to the matching rwsem primitive.
+#
+# Usage:
+#   rwlock-fix [options] [path to kernel source dir]
+#
+# Default kernel dir: current directory. By default no backup is created;
+# pass --backup to keep a timestamped copy of the original file.
+#
+# Exit codes:
+#   0  fix applied (or already fixed / no-op)
+#   1  user error (bad path, unreadable file, unknown flag, ...)
+#   2  edit failed and backup was restored
+#   3  edit failed; backup could not be restored (manual intervention needed)
 
 set -euo pipefail
 
-KDIR="${1:-.}"
+readonly PROG="${BASH_SOURCE[0]##*/}"
+readonly VERSION="1.1.0"
+
+# Defaults
+KDIR="."
+CREATE_BACKUP=0
+DRY_RUN=0
+VERBOSE=0
+
+# ============================================================================
+# Logging & Output Functions
+# (Style kept consistent with ksu-install / ksun-install / drspace-install)
+# ============================================================================
+log_info()    { printf '\033[1;34m[INFO]\033[0m  %s\n' "$*"; }
+log_success() { printf '\033[1;32m[OK]\033[0m   %s\n' "$*"; }
+log_warn()    { printf '\033[1;33m[WARN]\033[0m  %s\n' "$*"; }
+log_error()   { printf '\033[1;31m[ERROR]\033[0m %s\n' "$*" >&2; }
+log_debug()   { [[ "${VERBOSE:-0}" -eq 1 ]] && printf '\033[1;36m[DEBUG]\033[0m %s\n' "$*" || true; }
+log_step()    { printf '\n\033[1;35m>>> %s\033[0m\n' "$*"; }
+
+die() {
+    log_error "$*"
+    exit 1
+}
+
+usage() {
+    cat <<EOF
+$PROG v$VERSION — fix mixed rwlock/rwsem usage in mm/vmscan.c
+
+Usage:
+  $PROG [options] [kernel-source-dir]
+
+Arguments:
+  kernel-source-dir       Path to kernel source tree (default: current directory)
+
+Options:
+  --backup                Create a timestamped backup of mm/vmscan.c before
+                          editing it. Default: no backup.
+                          Backup suffix: .rwfix-backup.YYYYMMDD_HHMMSS
+  --dry-run               Show what would be done without modifying any file.
+  --verbose               Enable detailed [DEBUG] logging.
+  -h, --help              Show this help message and exit.
+  --version               Show version and exit.
+
+Examples:
+  $PROG                                    # Fix ./mm/vmscan.c, no backup
+  $PROG --backup                           # Fix ./mm/vmscan.c, keep backup
+  $PROG --dry-run ~/kernels/my-vendor      # Preview fix only
+  $PROG --backup --verbose external/linux  # Fix + backup + debug logs
+EOF
+}
+
+# ============================================================================
+# Argument parsing
+# ============================================================================
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --backup)    CREATE_BACKUP=1; shift ;;
+        --dry-run)   DRY_RUN=1; shift ;;
+        --verbose)   VERBOSE=1; shift ;;
+        -h|--help)   usage; exit 0 ;;
+        --version)   printf '%s %s\n' "$PROG" "$VERSION"; exit 0 ;;
+        --)          shift; break ;;
+        -*)
+            die "Unknown option: $1 (try --help)"
+            ;;
+        *)
+            # First positional is KDIR; reject extra positionals.
+            if [[ -z "${KDIR_SET:-}" ]]; then
+                KDIR="$1"
+                KDIR_SET=1
+            else
+                die "Unexpected extra argument: $1"
+            fi
+            shift
+            ;;
+    esac
+done
+
+# ============================================================================
+# Resolve kernel directory
+# ============================================================================
+# Resolve to an absolute, real path so later checks are unambiguous even if
+# the user passed a relative path or a path containing ".." components.
+if ! KDIR_ABS="$(cd "$KDIR" 2>/dev/null && pwd -P)"; then
+    die "Kernel directory does not exist or is not accessible: $KDIR"
+fi
+KDIR="$KDIR_ABS"
 FILE="$KDIR/mm/vmscan.c"
 
-if [ ! -f "$FILE" ]; then
-    echo "Error: $FILE not found" >&2
-    exit 1
+log_step "Inspecting $FILE"
+log_info "Kernel dir: $KDIR"
+log_info "Options: backup=$([ "$CREATE_BACKUP" -eq 1 ] && echo yes || echo no) \
+dry-run=$([ "$DRY_RUN" -eq 1 ] && echo yes || echo no) \
+verbose=$([ "$VERBOSE" -eq 1 ] && echo yes || echo no)"
+
+if [[ ! -e "$FILE" ]]; then
+    die "Target file not found: $FILE (is this a kernel source tree?)"
+fi
+if [[ ! -f "$FILE" ]]; then
+    die "Target path is not a regular file: $FILE"
+fi
+if [[ -L "$FILE" ]]; then
+    die "Target is a symlink: $FILE (refusing to edit symlinks; resolve first)"
+fi
+if [[ ! -r "$FILE" ]]; then
+    die "Target is not readable: $FILE"
+fi
+if [[ ! -w "$FILE" ]]; then
+    die "Target is not writable: $FILE (need write permission to edit in place)"
 fi
 
-if [ ! -w "$FILE" ]; then
-    echo "Error: $FILE is not writable" >&2
-    exit 1
-fi
+# ============================================================================
+# Detect current state of the file
+# ============================================================================
+has_decl_rwlock=0     # DEFINE_RWLOCK(shrinker_rwlock)
+has_decl_rwsem=0      # DECLARE_RWSEM(shrinker_rwsem)
+has_uses_rwlock=0     # any remaining shrinker_rwlock reference
+has_uses_rwsem=0      # any remaining shrinker_rwsem reference
+has_define_rwsem=0    # user wrote DEFINE_RWSEM (common typo for static-init)
 
-# Idempotency: if already fixed, skip
-if grep -q 'static DECLARE_RWSEM(shrinker_rwsem);' "$FILE"; then
-    echo "Already fixed: $FILE"
+grep -q 'DEFINE_RWLOCK[[:space:]]*([[:space:]]*shrinker_rwlock[[:space:]]*)' \
+    "$FILE" && has_decl_rwlock=1 || true
+grep -q 'DECLARE_RWSEM[[:space:]]*([[:space:]]*shrinker_rwsem[[:space:]]*)' \
+    "$FILE" && has_decl_rwsem=1 || true
+grep -q 'shrinker_rwlock' "$FILE" && has_uses_rwlock=1 || true
+grep -q 'shrinker_rwsem'  "$FILE" && has_uses_rwsem=1  || true
+grep -q 'DEFINE_RWSEM[[:space:]]*([[:space:]]*shrinker_rwsem[[:space:]]*)' \
+    "$FILE" && has_define_rwsem=1 || true
+
+log_debug "State: has_decl_rwlock=$has_decl_rwlock has_decl_rwsem=$has_decl_rwsem \
+has_uses_rwlock=$has_uses_rwlock has_uses_rwsem=$has_uses_rwsem \
+has_define_rwsem=$has_define_rwsem"
+
+# Idempotency: fully fixed already.
+if [[ "$has_decl_rwsem" -eq 1 && "$has_uses_rwlock" -eq 0 ]]; then
+    log_success "Already fixed — DECLARE_RWSEM(shrinker_rwsem) is present and \
+no shrinker_rwlock references remain."
+    log_info "Nothing to do."
     exit 0
 fi
 
-# Check broken pattern exists
-if ! grep -q 'DEFINE_RWLOCK(shrinker_rwlock)' "$FILE"; then
-    echo "Warning: broken pattern not found in $FILE, may already be fixed or different version" >&2
+# User wrote DEFINE_RWSEM by mistake (DECLARE_RWSEM is the correct static form).
+# We refuse rather than silently "fix" — this is a different bug class.
+if [[ "$has_define_rwsem" -eq 1 ]]; then
+    log_error "Found DEFINE_RWSEM(shrinker_rwsem) — this should be \
+DECLARE_RWSEM (DEFINE_RWSEM is for runtime initialization, not static)."
+    log_error "Refusing to touch the file. Edit it manually or replace \
+DEFINE_RWSEM → DECLARE_RWSEM and re-run $PROG."
+    exit 1
 fi
 
-# Backup
-cp -f "$FILE" "$FILE.bak.rwfix"
-
-# Apply fix safely: only if broken declaration present
-if grep -q 'DEFINE_RWLOCK(shrinker_rwlock)' "$FILE"; then
-    sed -i 's/static DEFINE_RWLOCK(shrinker_rwlock);/static DECLARE_RWSEM(shrinker_rwsem);/' "$FILE"
+# Nothing to do: no broken pattern AND no partial fix.
+if [[ "$has_decl_rwlock" -eq 0 && "$has_uses_rwlock" -eq 0 ]]; then
+    log_warn "No shrinker_rwlock references found in $FILE"
+    log_warn "This kernel may already be fixed, may be a different version, \
+or may not be a kernel source tree at all."
+    log_info "Nothing to do."
+    exit 0
 fi
 
-# Only run replacements if shrinker_rwlock still exists (partial fix scenario)
-if grep -q 'shrinker_rwlock' "$FILE"; then
-    sed -i \
+# Report what we are about to do
+log_step "Planning edits"
+if [[ "$has_decl_rwlock" -eq 1 ]]; then
+    log_info "  - Replace declaration: DEFINE_RWLOCK(shrinker_rwlock) → \
+DECLARE_RWSEM(shrinker_rwsem)"
+fi
+if [[ "$has_uses_rwlock" -eq 1 ]]; then
+    log_info "  - Rename identifier:   shrinker_rwlock → shrinker_rwsem"
+    log_info "  - Convert write_lock/unlock → down_write/up_write"
+    log_info "  - Convert read_lock/unlock  → down_read/up_read"
+    log_info "  - Convert rwlock_is_contended → rwsem_is_contended"
+fi
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+    log_info "Dry-run mode: no changes made."
+    exit 0
+fi
+
+# ============================================================================
+# Backup (only if requested)
+# ============================================================================
+BACKUP_PATH=""
+if [[ "$CREATE_BACKUP" -eq 1 ]]; then
+    ts="$(date +%Y%m%d_%H%M%S)"
+    BACKUP_PATH="$FILE.rwfix-backup.$ts"
+    if ! cp -p "$FILE" "$BACKUP_PATH"; then
+        die "Failed to create backup at $BACKUP_PATH"
+    fi
+    log_info "Backup created: $BACKUP_PATH"
+else
+    log_debug "Skipping backup (--backup not set)"
+fi
+
+# ============================================================================
+# Apply edits atomically
+# ============================================================================
+# We stage to a temp file and only `mv` it into place once sed succeeded.
+# If anything between cp and mv fails we restore the backup (if any) so the
+# user is not left with a half-edited file.
+TMP="${FILE}.rwfix-tmp.$$"
+trap 'rc=$?; rm -f "$TMP" 2>/dev/null || true; exit $rc' EXIT
+
+restore_backup_or_die() {
+    if [[ -n "$BACKUP_PATH" && -f "$BACKUP_PATH" ]]; then
+        if cp -p "$BACKUP_PATH" "$FILE"; then
+            log_error "Edit failed; restored $FILE from $BACKUP_PATH"
+            exit 2
+        else
+            log_error "Edit failed AND restore from $BACKUP_PATH failed"
+            log_error "Original backup preserved at: $BACKUP_PATH"
+            log_error "Manual recovery: cp $BACKUP_PATH $FILE"
+            exit 3
+        fi
+    else
+        log_error "Edit failed; no backup to restore from"
+        log_error "The file at $FILE may be in a half-edited state. Re-run \
+$PROG on a clean copy of the original."
+        exit 3
+    fi
+}
+
+if ! cp -p "$FILE" "$TMP"; then
+    restore_backup_or_die
+fi
+
+edits_applied=0
+
+if [[ "$has_decl_rwlock" -eq 1 ]]; then
+    if ! sed -i \
+        's/static DEFINE_RWLOCK(shrinker_rwlock);/static DECLARE_RWSEM(shrinker_rwsem);/' \
+        "$TMP"; then
+        restore_backup_or_die
+    fi
+    edits_applied=$((edits_applied + 1))
+    log_debug "Replaced declaration"
+fi
+
+if grep -q 'shrinker_rwlock' "$TMP"; then
+    # partial-fix path: declaration already renamed, only call sites remain
+    if ! sed -i \
         -e 's/shrinker_rwlock/shrinker_rwsem/g' \
         -e 's/write_lock(&shrinker_rwsem)/down_write(\&shrinker_rwsem)/g' \
         -e 's/write_unlock(&shrinker_rwsem)/up_write(\&shrinker_rwsem)/g' \
         -e 's/read_lock(&shrinker_rwsem)/down_read(\&shrinker_rwsem)/g' \
         -e 's/read_unlock(&shrinker_rwsem)/up_read(\&shrinker_rwsem)/g' \
         -e 's/rwlock_is_contended(&shrinker_rwsem)/rwsem_is_contended(\&shrinker_rwsem)/g' \
-        "$FILE"
+        "$TMP"; then
+        restore_backup_or_die
+    fi
+    edits_applied=$((edits_applied + 1))
+    log_debug "Converted call sites"
 fi
 
-# Verify no leftover broken references
-if grep -q 'shrinker_rwlock' "$FILE"; then
-    echo "Warning: leftover shrinker_rwlock references found in $FILE" >&2
+# Sanity check: nothing should still mention shrinker_rwlock.
+if grep -q 'shrinker_rwlock' "$TMP"; then
+    log_error "After edits, shrinker_rwlock references remain in the temp \
+file — refusing to install a broken file."
+    restore_backup_or_die
 fi
 
-# Verify syntax sanity: no undefined macros
-if grep -q 'DEFINE_RWSEM' "$FILE"; then
-    echo "Error: DEFINE_RWSEM still present (should be DECLARE_RWSEM)" >&2
-    exit 1
+# Sanity check: typo guard for DEFINE_RWSEM.
+if grep -q 'DEFINE_RWSEM[[:space:]]*([[:space:]]*shrinker_rwsem[[:space:]]*)' "$TMP"; then
+    log_error "After edits, DEFINE_RWSEM(shrinker_rwsem) appeared — refusing."
+    restore_backup_or_die
 fi
 
-echo "Fixed $FILE (backup: $FILE.bak.rwfix)"
+# Promote temp into place atomically.
+if ! mv -f "$TMP" "$FILE"; then
+    restore_backup_or_die
+fi
+rm -f "$TMP"
+trap - EXIT
+
+# ============================================================================
+# Final summary
+# ============================================================================
+log_step "Done"
+log_success "Fixed $FILE ($edits_applied edit step(s) applied)"
+if [[ -n "$BACKUP_PATH" ]]; then
+    log_info "Backup: $BACKUP_PATH"
+fi
