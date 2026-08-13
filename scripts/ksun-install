@@ -25,6 +25,8 @@ readonly KSU_KERNEL_SOURCE="$KSU_SUBMODULE_PATH/kernel"
 # Options
 SKIP_KSU_FETCH=0
 BACKPORT_PATH_UMOUNT=0
+INTEGRATE_COPY=0   # --integrate: copy KSU source into kernel tree instead of symlink
+CREATE_BACKUP=0    # --backup: create backup files before patching (default: no backup)
 
 # Required kernel configs for kprobe method
 readonly KPROBE_CONFIGS=(
@@ -170,13 +172,18 @@ backup_and_verify() {
     local backup_pattern="${file}.ksun-backup.*"
     local existing_backup
     existing_backup=$(ls -t ${backup_pattern} 2>/dev/null | head -1)
-    
+
     if [[ -n "$existing_backup" ]]; then
         log_debug "Using existing backup: $existing_backup"
         echo "$existing_backup"
         return 0
     fi
-    
+
+    if [[ $CREATE_BACKUP -eq 0 ]]; then
+        # No backup requested; just echo empty
+        return 0
+    fi
+
     local backup
     backup=$(backup_file "$file")
     [[ -f "$backup" ]] || { log_error "Failed to create backup for $file"; return 1; }
@@ -205,6 +212,19 @@ Arguments (Standalone Mode - path_umount backport only):
 
 Options:
   --skip-ksu-fetch          Skip fetching/updating KernelSU Next submodule (use existing)
+  --integrate               Instead of creating a symlink at drivers/kernelsu ->
+                            external/KernelSU-Next/kernel, COPY the KSU kernel
+                            source into the kernel tree as a real directory.
+                            Useful for kernel trees outside the lavender repo
+                            (standalone builds, vendor trees) where following
+                            a symlink back to a non-existent repo would break
+                            the build. The KSU submodule is still fetched and
+                            pinned to the legacy branch so the copy contains
+                            the correct version; only the integration step
+                            (symlink -> copy) changes.
+  --backup                  Create backup files (.ksun-backup.*) before patching
+                            kernel source files. By default, NO backup is created.
+                            Use this flag if you want backups for manual recovery.
   --backport-path_umount    Also apply path_umount backport (for pre-5.9 kernels)
                             In full integration: applies in addition to normal steps
                             Without method: standalone mode (only this backport)
@@ -235,6 +255,11 @@ Examples:
   # Full integration with explicit kernel source
   $SCRIPT_NAME kprobe /path/to/kernel vendor/lavender_defconfig
   $SCRIPT_NAME manual /path/to/kernel lavender_defconfig
+
+  # Full integration but COPY KernelSU source into the kernel tree instead of
+  # symlinking it. Use this for kernel trees that live outside the lavender repo.
+  $SCRIPT_NAME --integrate manual lavender_defconfig
+  $SCRIPT_NAME --integrate kprobe /path/to/standalone/kernel vendor/lavender_defconfig
 
   # Full integration WITH path_umount backport (pre-5.9 kernels)
   $SCRIPT_NAME manual --backport-path_umount lavender_defconfig
@@ -267,6 +292,8 @@ validate_args() {
     for arg in "$@"; do
         case "$arg" in
             --skip-ksu-fetch) SKIP_KSU_FETCH=1 ;;
+            --integrate) INTEGRATE_COPY=1 ;;
+            --backup) CREATE_BACKUP=1 ;;
             --backport-path_umount) has_backport_flag=1 ;;
             *) args+=("$arg") ;;
         esac
@@ -345,6 +372,8 @@ validate_args() {
     log_debug "Defconfig: ${DEFCONFIG_PATH:-<none>}"
     log_debug "Skip KSU fetch: $SKIP_KSU_FETCH"
     log_debug "Backport path_umount: $BACKPORT_PATH_UMOUNT"
+    log_debug "Integrate copy: $INTEGRATE_COPY"
+    log_debug "Create backup: $CREATE_BACKUP"
 }
 
 # ============================================================================
@@ -371,10 +400,10 @@ detect_existing_ksu() {
         driver_dir="drivers"  # default for checks
     fi
 
-    # Check KernelSU source (submodule) and symlink in kernel tree
-    if [[ -d "$KSU_KERNEL_SOURCE" ]] && [[ -L "$KERNEL_SRC/$driver_dir/kernelsu" ]]; then
+    # Check KernelSU source (submodule) and integration in kernel tree
+    if [[ -d "$KSU_KERNEL_SOURCE" ]] && { [[ -L "$KERNEL_SRC/$driver_dir/kernelsu" ]] || [[ -d "$KERNEL_SRC/$driver_dir/kernelsu" && -f "$KERNEL_SRC/$driver_dir/kernelsu/.ksun-integrated-copy" ]]; }; then
         has_ksu_source=1
-        log_info "KernelSU-Next source detected: $KSU_KERNEL_SOURCE (symlinked in $driver_dir/kernelsu)"
+        log_info "KernelSU-Next source detected: $KSU_KERNEL_SOURCE (in $driver_dir/kernelsu)"
     fi
     
     # Check manual patches in kernel source
@@ -540,6 +569,16 @@ fetch_ksu_source() {
         log_info "Skipping submodule update (--skip-ksu-fetch specified)"
     fi
 
+    # Auto-detect version from submodule (for logging purposes)
+    local current_count current_tag
+    current_count=$(git -C "$KSU_SUBMODULE_PATH" rev-list --count HEAD 2>/dev/null || echo "unknown")
+    current_tag=$(git -C "$KSU_SUBMODULE_PATH" describe --tags --abbrev=0 2>/dev/null || echo "unknown")
+    local current_version="unknown"
+    if [[ "$current_count" != "unknown" ]]; then
+        current_version=$((30000 + current_count + 200))
+    fi
+    log_info "KernelSU-Next version: $current_tag (commit count: $current_count, KSU_VERSION: $current_version)"
+
     # Verify KernelSU source structure
     [[ -d "$KSU_KERNEL_SOURCE" ]] || die "KernelSU kernel source not found at $KSU_KERNEL_SOURCE"
     [[ -f "$KSU_KERNEL_SOURCE/Kconfig" ]] || die "KernelSU source incomplete - Kconfig missing"
@@ -575,22 +614,113 @@ integrate_ksu_into_kernel() {
     local rel_path
     rel_path=$(realpath --relative-to="$(pwd)/$driver_dir" "$KSU_KERNEL_SOURCE")
 
-    # 1. Create/update symlink: drivers/kernelsu -> external/KernelSU-Next/kernel
-    if [[ -L "$kernelsu_symlink" ]]; then
-        local current_target
-        current_target=$(readlink "$kernelsu_symlink")
-        if [[ "$current_target" != "$rel_path" ]]; then
-            log_info "Updating kernelsu symlink: $current_target -> $rel_path"
-            rm "$kernelsu_symlink"
-            ln -sf "$rel_path" "$kernelsu_symlink"
-        else
-            log_debug "kernelsu symlink already correct"
+    # 1. Create/update integration: symlink by default, real directory copy with
+    #    --integrate. With --integrate the copy is a self-contained snapshot of
+    #    $KSU_KERNEL_SOURCE so the kernel tree does not depend on external/KernelSU-Next
+    #    existing at build time. We never silently overwrite an unrelated non-empty
+    #    directory; a marker file (.ksun-integrated-copy) marks our own copies.
+    local ks_marker="$kernelsu_symlink/.ksun-integrated-copy"
+    if [[ $INTEGRATE_COPY -eq 1 ]]; then
+        # ---- copy mode ----
+        if [[ -L "$kernelsu_symlink" ]]; then
+            local old_target
+            old_target=$(readlink "$kernelsu_symlink")
+            log_info "Replacing existing symlink with copy (was -> $old_target)"
+            rm -f "$kernelsu_symlink"
+        elif [[ -d "$kernelsu_symlink" ]]; then
+            if [[ -f "$ks_marker" ]]; then
+                log_info "Refreshing previous KSU copy at $kernelsu_symlink"
+                rm -rf "$kernelsu_symlink"
+            else
+                die "$kernelsu_symlink already exists as a directory and is NOT a previous KSU copy (no .ksun-integrated-copy marker). Remove it manually or drop --integrate."
+            fi
         fi
-    elif [[ -e "$kernelsu_symlink" ]]; then
-        die "$kernelsu_symlink exists but is not a symlink. Remove it manually first."
+
+        log_info "Copying KSU source into kernel tree ($kernelsu_symlink)"
+        mkdir -p "$kernelsu_symlink"
+        cp -a "$KSU_KERNEL_SOURCE/." "$kernelsu_symlink/"
+        # Strip any git leftovers so the copy is a plain source tree.
+        rm -rf "$kernelsu_symlink/.git"
+        # Copy parent-level uapi/ if it exists (needed for includes like "uapi/selinux.h")
+        if [[ -d "$KSU_SUBMODULE_PATH/uapi" ]]; then
+            cp -a "$KSU_SUBMODULE_PATH/uapi" "$kernelsu_symlink/uapi"
+            log_info "Copied uapi/ from submodule"
+        fi
+
+        # ---- Standalone-build fix: KSU_GIT_VERSION ----
+        # The KSU Kbuild computes KSU_GIT_VERSION from `git rev-list --count HEAD`
+        # inside the source tree (Kbuild:75-83). In the symlink case the build
+        # follows the symlink into external/KernelSU-Next/ (a real git repo) and
+        # KSU_GIT_VERSION_VALID gets set. In the --integrate/copy case the copy
+        # has no .git directory so KSU_GIT_VERSION_VALID is never set and the
+        # build falls back to KSU_VERSION=1 with the warning:
+        #   "KSU_GIT_VERSION not defined! It is better to make KernelSU-Next a
+        #    git repository!"
+        # Since the user explicitly does NOT want the submodule modified and the
+        # copied tree is not a repo, we patch the copied Kbuild to hardcode the
+        # version computed from the submodule we just copied FROM (preserves the
+        # correct version, silences the warning, leaves the submodule untouched).
+        local ksu_kbuild="$kernelsu_symlink/Kbuild"
+        local ksu_count ksu_version ksu_tag
+        ksu_count=$(git -C "$KSU_SUBMODULE_PATH" rev-list --count HEAD 2>/dev/null || echo "")
+        ksu_version=$((30000 + ksu_count + 200))   # upstream formula from Kbuild:91
+        ksu_tag=$(git -C "$KSU_SUBMODULE_PATH" describe --tags --abbrev=0 2>/dev/null || echo "legacy")
+        if [[ -n "$ksu_count" && -f "$ksu_kbuild" ]]; then
+            log_info "Patching copied KSU Kbuild with hardcoded KSU_GIT_VERSION=$ksu_count (KSU_VERSION=$ksu_version, tag=$ksu_tag)"
+            # Replace the git-detection block (lines 75-86) with a clean hardcoded
+            # version. We do the replacement with awk to be robust to whitespace.
+            local tmp_kbuild
+            tmp_kbuild=$(mktemp)
+            awk -v count="$ksu_count" -v tag="$ksu_tag" '
+                BEGIN { in_block = 0; depth = 0 }
+                /^GIT_ROOT :=/ && !in_block {
+                    print "# Auto-generated by ksun-install --integrate: KSU_GIT_VERSION"
+                    print "# hardcoded because the kernel tree is standalone (no"
+                    print "# upstream escape hatch exists for non-submodule builds)."
+                    print "KSU_GIT_VERSION := " count
+                    print "KSU_GIT_TAG := \"" tag "\""
+                    print "KSU_GIT_VERSION_VALID := 1"
+                    in_block = 1
+                    next
+                }
+                in_block {
+                    if (/^if/) { depth++; next }
+                    if (/^endif$/) {
+                        depth--
+                        if (depth <= 0) { in_block = 0 }
+                        next
+                    }
+                    next
+                }
+                { print }
+            ' "$ksu_kbuild" > "$tmp_kbuild"
+            mv "$tmp_kbuild" "$ksu_kbuild"
+            log_info "KSU Kbuild patched (submodule left untouched)"
+        else
+            log_warn "Could not compute KSU_GIT_VERSION from submodule (count='$ksu_count'). Copy may build with fallback KSU_VERSION=1."
+        fi
+
+        # Drop the marker so we can detect this directory on later runs.
+        echo "Copied from $KSU_KERNEL_SOURCE at $(date -u +%FT%TZ)  KSU_VERSION=$ksu_version" > "$ks_marker"
+        log_info "KSU copy complete; marker written to $ks_marker"
     else
-        log_info "Creating kernelsu symlink -> $rel_path"
-        ln -sf "$rel_path" "$kernelsu_symlink"
+        # ---- symlink mode (default) ----
+        if [[ -L "$kernelsu_symlink" ]]; then
+            local current_target
+            current_target=$(readlink "$kernelsu_symlink")
+            if [[ "$current_target" != "$rel_path" ]]; then
+                log_info "Updating kernelsu symlink: $current_target -> $rel_path"
+                rm "$kernelsu_symlink"
+                ln -sf "$rel_path" "$kernelsu_symlink"
+            else
+                log_debug "kernelsu symlink already correct"
+            fi
+        elif [[ -e "$kernelsu_symlink" ]]; then
+            die "$kernelsu_symlink exists but is not a symlink. Remove it manually first."
+        else
+            log_info "Creating kernelsu symlink -> $rel_path"
+            ln -sf "$rel_path" "$kernelsu_symlink"
+        fi
     fi
 
     # 2. Update drivers/Makefile: add obj-$(CONFIG_KSU) += kernelsu/
@@ -623,8 +753,10 @@ update_defconfig() {
     local configs=("$@")
     log_step "Updating defconfig: $(basename "$DEFCONFIG_PATH")"
 
-    local backup
-    backup=$(backup_file "$DEFCONFIG_PATH")
+    local backup=""
+    if [[ $CREATE_BACKUP -eq 1 ]]; then
+        backup=$(backup_file "$DEFCONFIG_PATH")
+    fi
 
     local modified=0
     for config in "${configs[@]}"; do
@@ -1311,7 +1443,8 @@ verify_integration() {
     else
         die "Could not find drivers/ directory in kernel source"
     fi
-    [[ -L "$KERNEL_SRC/$driver_dir/kernelsu" ]] || die "kernelsu symlink missing in $driver_dir"
+    [[ -L "$KERNEL_SRC/$driver_dir/kernelsu" || -d "$KERNEL_SRC/$driver_dir/kernelsu" ]] \
+        || die "kernelsu missing in $driver_dir (expected symlink or --integrate copy)"
 
     # Check defconfig has CONFIG_KSU
     grep -q "^CONFIG_KSU=y" "$DEFCONFIG_PATH" || die "CONFIG_KSU not enabled in defconfig"
@@ -1374,7 +1507,8 @@ main() {
         log_step "Integration Complete"
         log_success "path_umount backport applied to $KERNEL_SRC/$BACKPORT_PATH_UMOUNT_FILE"
         log_info "This enables 'Umount module' feature on pre-5.9 / pre-GKI kernels"
-        log_info "Backup file created: $KERNEL_SRC/$BACKPORT_PATH_UMOUNT_FILE.ksun-backup.*"
+        log_info "  Backup file created: $KERNEL_SRC/$BACKPORT_PATH_UMOUNT_FILE.ksun-backup.*"
+        log_info "  (Only created if --backup was specified)"
         log_info "Next steps:"
         log_info "  1. Build your kernel: make -C $KERNEL_SRC"
         log_info "  2. Flash the resulting boot.img"
@@ -1420,8 +1554,9 @@ main() {
     log_info "  3. If using kprobe and bootloops: kprobe is broken, use 'manual' method instead"
 
     if [[ "$METHOD" == "manual" ]]; then
-        log_info "  Backup files created: *.ksun-backup.* in each patched directory"
-
+        if [[ $CREATE_BACKUP -eq 1 ]]; then
+            log_info "  Backup files created: *.ksun-backup.* in each patched directory"
+        fi
     fi
     if [[ $BACKPORT_PATH_UMOUNT -eq 1 ]]; then
         log_info "  path_umount backport applied for pre-5.9 kernel compatibility"
