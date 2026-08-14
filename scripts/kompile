@@ -10,13 +10,14 @@ usage() {
 Usage: $SCRIPT_NAME [toolchain] [<kernel_source_dir>] [defconfig] [options]
 
 Toolchains:
-  san-gcc   - SAN-GCC (GCC-based cross-compiler)
-  neutron   - Neutron Clang (LLVM-based)
-  azure     - Azure Clang (LLVM-based)
-  proton    - Proton Clang (LLVM-based)
+  san-gcc     - SAN-GCC (GCC-based cross-compiler)
+  neutron     - Neutron Clang latest (LLVM-based, LLVM-only binutils)
+  neutron-18  - Neutron Clang 18 (LLVM-based, bundled GNU binutils)
+  azure       - Azure Clang (LLVM-based)
+  proton      - Proton Clang (LLVM-based)
 
 Arguments:
-  toolchain         Required. One of: san-gcc, neutron, azure, proton
+  toolchain         Required. One of: san-gcc, neutron, neutron-18, azure, proton
   kernel_source_dir Optional. Path to kernel source directory (default: current working directory)
   defconfig         Optional. Defconfig name (relative to arch/arm64/configs/).
                     Required unless --continue is used or default exists for toolchain.
@@ -31,6 +32,9 @@ Options:
   --no-ccache            Disable ccache (enabled by default).
   --dtb                  Also build DTBs (make dtbs)
   --dtbo                 Also build DTBOs (make dtbs dtbo)
+  --werror               Treat warnings as errors (KCFLAGS=-Werror)
+  --arm32-gcc <dir>      Path to a 32-bit ARM compiler (arm-linux-gnueabi-gcc) used for
+                        the compat vDSO on kernels < 4.14. Auto-detected if omitted.
 
 Environment:
   KBUILD_BUILD_USER      Override build user (default: current user)
@@ -82,9 +86,11 @@ OUT_DIR="out"
 USE_CCACHE=true
 BUILD_DTBS=false
 BUILD_DTBO=false
+ARM32_GCC_DIR=""
 
 # First pass: collect positional args and flags separately
 POSITIONAL_ARGS=()
+WERROR=false
 while [[ $# -gt 0 ]]; do
     case $1 in
         --continue|--resume)
@@ -125,6 +131,17 @@ while [[ $# -gt 0 ]]; do
             BUILD_DTBO=true
             shift
             ;;
+        --werror)
+            WERROR=true
+            shift
+            ;;
+        --arm32-gcc)
+            if [[ -z ${2:-} ]]; then
+                error "--arm32-gcc requires a directory argument"
+            fi
+            ARM32_GCC_DIR="$2"
+            shift 2
+            ;;
         --help|-h)
             usage
             ;;
@@ -143,7 +160,7 @@ done
 TOOLCHAIN="${POSITIONAL_ARGS[0]}"
 
 # Validate toolchain early
-VALID_TOOLCHAINS="san-gcc neutron azure proton"
+VALID_TOOLCHAINS="san-gcc neutron neutron-18 azure proton"
 if [[ ! " $VALID_TOOLCHAINS " =~ " $TOOLCHAIN " ]]; then
     error "Invalid toolchain: $TOOLCHAIN. Valid options: $VALID_TOOLCHAINS"
 fi
@@ -184,6 +201,7 @@ fi
 declare -A TOOLCHAIN_CONFIGS=(
     [san-gcc]="GCC"
     [neutron]="CLANG"
+    [neutron-18]="CLANG"
     [azure]="CLANG"
     [proton]="CLANG"
 )
@@ -191,6 +209,7 @@ declare -A TOOLCHAIN_CONFIGS=(
 declare -A TOOLCHAIN_DIRS=(
     [san-gcc]="$TOOLCHAINS_BASE_DIR/san-gcc/bin"
     [neutron]="$TOOLCHAINS_BASE_DIR/neutron-clang/bin"
+    [neutron-18]="$TOOLCHAINS_BASE_DIR/neutron-18/bin"
     [azure]="$TOOLCHAINS_BASE_DIR/azure-clang/bin"
     [proton]="$TOOLCHAINS_BASE_DIR/proton-clang/bin"
 )
@@ -198,6 +217,7 @@ declare -A TOOLCHAIN_DIRS=(
 declare -A DEFAULT_DEFCONFIGS=(
     [san-gcc]="lavender_defconfig"
     [neutron]="vendor/lavender-perf_defconfig"
+    [neutron-18]="vendor/lavender-perf_defconfig"
     [azure]="lavender_defconfig"
     [proton]="lavender_defconfig"
 )
@@ -266,7 +286,7 @@ case $TOOLCHAIN in
         log "Toolchain version:"
         aarch64-linux-gcc --version | head -1
         ;;
-    neutron|azure|proton)
+    neutron|neutron-18|azure|proton)
         if [[ ! -f "$TOOLCHAIN_DIR/clang" ]]; then
             error "Clang not found in toolchain: $TOOLCHAIN_DIR/clang"
         fi
@@ -278,8 +298,8 @@ case $TOOLCHAIN in
             fi
         done
         
-        # Azure and Proton require additional cross-compile binutils
-        if [[ $TOOLCHAIN == "azure" || $TOOLCHAIN == "proton" ]]; then
+        # Azure, Proton and Neutron-18 bundle GNU binutils; require them
+        if [[ $TOOLCHAIN == "azure" || $TOOLCHAIN == "proton" || $TOOLCHAIN == "neutron-18" ]]; then
             for tool in aarch64-linux-gnu-ld aarch64-linux-gnu-as arm-linux-gnueabi-ld arm-linux-gnueabi-as; do
                 if [[ ! -f "$TOOLCHAIN_DIR/$tool" && ! -L "$TOOLCHAIN_DIR/$tool" ]]; then
                     error "Required tool '$tool' not found in $TOOLCHAIN_DIR"
@@ -290,10 +310,98 @@ case $TOOLCHAIN in
         export PATH="$TOOLCHAIN_DIR:$PATH"
         log "Toolchain version:"
         clang --version | head -1
+
+        # Older prebuilt clang/lld toolchains (e.g. neutron-18, built ~2023)
+        # link against sonames the host may have since bumped, most commonly
+        # libxml2.so.2 (Arch now ships libxml2.so.16). Auto-create compat
+        # symlinks to a newer host lib so ld.lld/clang can load.
+        setup_lib_shims() {
+            local tcdir="$1"
+            local shimdir="$tcdir/../compat-libs"
+            local made=0
+            # Collect missing sonames across key binaries
+            local missing
+            missing="$(
+                for b in clang ld.lld lld llvm-ar; do
+                    [[ -e "$tcdir/$b" ]] && ldd "$tcdir/$b" 2>/dev/null | awk '/not found/{print $1}'
+                done | sort -u
+            )"
+            [[ -z "$missing" ]] && return 0
+            mkdir -p "$shimdir"
+            local so base host_match
+            while IFS= read -r so; do
+                [[ -z "$so" ]] && continue
+                # base soname without version, e.g. libxml2.so
+                base="${so%.so.*}.so"
+                # find a host-provided versioned lib for this base
+                host_match="$(ldconfig -p 2>/dev/null | grep -oE "/[^ ]*${base##*/}\.[0-9]+" | head -1)"
+                if [[ -n "$host_match" && -e "$host_match" ]]; then
+                    ln -sf "$host_match" "$shimdir/$so"
+                    log "compat shim: $so -> $host_match"
+                    made=1
+                else
+                    warn "No host replacement found for missing lib: $so"
+                fi
+            done <<< "$missing"
+            if [[ $made -eq 1 ]]; then
+                export LD_LIBRARY_PATH="$(cd "$shimdir" && pwd)${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            fi
+        }
+        setup_lib_shims "$TOOLCHAIN_DIR"
         ;;
 esac
 
 echo ""
+
+# Determine kernel version and resolve the 32-bit (compat vDSO) compiler.
+# Kernels < 4.14 gate the vDSO on CROSS_COMPILE_ARM32 (hard $(error) in
+# arch/arm64/Makefile when it is empty); 4.14+ use CROSS_COMPILE_COMPAT.
+KERNEL_MAJOR=0
+KERNEL_MINOR=0
+if [[ -f Makefile ]]; then
+    KERNEL_MAJOR="$(sed -n 's/^VERSION = //p' Makefile | head -1)"
+    KERNEL_MINOR="$(sed -n 's/^PATCHLEVEL = //p' Makefile | head -1)"
+fi
+KERNEL_MAJOR="${KERNEL_MAJOR:-0}"
+KERNEL_MINOR="${KERNEL_MINOR:-0}"
+log "Kernel version: ${KERNEL_MAJOR}.${KERNEL_MINOR}"
+
+# Locate a 32-bit ARM gcc for the compat vDSO.
+# Priority: --arm32-gcc > system PATH (arm-linux-gnueabi-gcc) > san-gcc toolchain.
+ARM32_GCC_BIN=""
+if [[ -n "$ARM32_GCC_DIR" ]]; then
+    if [[ ! -x "$ARM32_GCC_DIR/bin/arm-linux-gnueabi-gcc" ]]; then
+        error "No arm-linux-gnueabi-gcc in --arm32-gcc dir: $ARM32_GCC_DIR/bin"
+    fi
+    ARM32_GCC_BIN="$ARM32_GCC_DIR/bin/arm-linux-gnueabi-gcc"
+elif command -v arm-linux-gnueabi-gcc >/dev/null 2>&1; then
+    ARM32_GCC_BIN="$(command -v arm-linux-gnueabi-gcc)"
+elif [[ -x "$TOOLCHAINS_BASE_DIR/san-gcc/bin/arm-linux-gnueabi-gcc" ]]; then
+    ARM32_GCC_BIN="$TOOLCHAINS_BASE_DIR/san-gcc/bin/arm-linux-gnueabi-gcc"
+fi
+
+# Decide how to satisfy the 32-bit vDSO requirement.
+ARM32_COMPILE_VAR=""    # make variable name to set (if a compiler was found)
+ARM32_COMPILE_VAL=""    # its value (the prefix)
+VDSO_DISABLE_CONFIG=""  # config symbol to disable if no compiler is available
+if [[ -n "$ARM32_GCC_BIN" ]]; then
+    ARM32_GCC_BIN_DIR="$(cd "$(dirname "$ARM32_GCC_BIN")" && pwd)"
+    export PATH="$ARM32_GCC_BIN_DIR:$PATH"
+    if [[ $KERNEL_MAJOR -eq 4 && $KERNEL_MINOR -lt 14 ]]; then
+        ARM32_COMPILE_VAR="CROSS_COMPILE_ARM32"
+    else
+        ARM32_COMPILE_VAR="CROSS_COMPILE_COMPAT"
+    fi
+    ARM32_COMPILE_VAL="arm-linux-gnueabi-"
+    log "32-bit compiler: $ARM32_GCC_BIN_DIR/arm-linux-gnueabi-gcc"
+else
+    warn "No 32-bit ARM gcc found; the compat vDSO will be disabled."
+    if [[ $KERNEL_MAJOR -eq 4 && $KERNEL_MINOR -lt 14 ]]; then
+        VDSO_DISABLE_CONFIG="CONFIG_VDSO"
+    else
+        VDSO_DISABLE_CONFIG="CONFIG_COMPAT_VDSO"
+    fi
+fi
 
 # Check build dependencies
 log "Checking build dependencies..."
@@ -350,7 +458,13 @@ fi
 # Use fixed timestamp by default for ccache-friendly reproducible builds.
 # Override with: KBUILD_BUILD_TIMESTAMP="2024-01-01 00:00:00 +0000" ./scripts/kompile ...
 export KBUILD_BUILD_USER="${KBUILD_BUILD_USER:-$(whoami)}"
-export KBUILD_BUILD_HOST="${KBUILD_BUILD_HOST:-$(hostname)}"
+# hostname(1) is not installed on all distros (e.g. Arch); fall back to uname -n.
+if command -v hostname >/dev/null 2>&1; then
+    _DEFAULT_HOST="$(hostname)"
+else
+    _DEFAULT_HOST="$(uname -n)"
+fi
+export KBUILD_BUILD_HOST="${KBUILD_BUILD_HOST:-$_DEFAULT_HOST}"
 export KBUILD_BUILD_TIMESTAMP="${KBUILD_BUILD_TIMESTAMP:-2024-01-01 00:00:00 +0000}"
 [[ -n "${CI_BUILD_NUMBER:-}" ]] && export KBUILD_BUILD_VERSION="$CI_BUILD_NUMBER"
 
@@ -370,13 +484,11 @@ case $TOOLCHAIN in
             MAKE_ARGS+=(
                 CC="ccache aarch64-linux-gcc"
                 CROSS_COMPILE=aarch64-linux-
-                CROSS_COMPILE_ARM32=arm-linux-gnueabi-
             )
         else
             MAKE_ARGS+=(
                 CC=aarch64-linux-gcc
                 CROSS_COMPILE=aarch64-linux-
-                CROSS_COMPILE_ARM32=arm-linux-gnueabi-
             )
         fi
         ;;
@@ -385,42 +497,36 @@ case $TOOLCHAIN in
             MAKE_ARGS+=(
                 CC="ccache clang"
                 CROSS_COMPILE=aarch64-linux-gnu-
-                CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
                 LLVM=1
                 LLVM_IAS=1
+                LD=ld.lld
             )
         else
             MAKE_ARGS+=(
                 CC=clang
                 CROSS_COMPILE=aarch64-linux-gnu-
-                CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
                 LLVM=1
                 LLVM_IAS=1
+                LD=ld.lld
             )
         fi
         ;;
-    azure)
+    azure|neutron-18)
         if [[ $USE_CCACHE == true ]]; then
             MAKE_ARGS+=(
                 CC="ccache clang"
                 CROSS_COMPILE=aarch64-linux-gnu-
-                CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
                 LLVM=1
                 LLVM_IAS=1
                 LD=ld.lld
-                HOSTLD=ld.lld
-                HOSTLDFLAGS=-fuse-ld=lld
             )
         else
             MAKE_ARGS+=(
                 CC=clang
                 CROSS_COMPILE=aarch64-linux-gnu-
-                CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
                 LLVM=1
                 LLVM_IAS=1
                 LD=ld.lld
-                HOSTLD=ld.lld
-                HOSTLDFLAGS=-fuse-ld=lld
             )
         fi
         ;;
@@ -429,27 +535,209 @@ case $TOOLCHAIN in
             MAKE_ARGS+=(
                 CC="ccache clang"
                 CROSS_COMPILE=aarch64-linux-gnu-
-                CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
                 LLVM=1
                 LLVM_IAS=1
                 LD=ld.lld
-                HOSTLD=ld.lld
-                HOSTLDFLAGS=-fuse-ld=lld
             )
         else
             MAKE_ARGS+=(
                 CC=clang
                 CROSS_COMPILE=aarch64-linux-gnu-
-                CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
                 LLVM=1
                 LLVM_IAS=1
                 LD=ld.lld
-                HOSTLD=ld.lld
-                HOSTLDFLAGS=-fuse-ld=lld
             )
         fi
         ;;
 esac
+
+# Universal host-link setup for clang toolchains.
+#
+# The kernel's host tools (fixdep, conf, dtc, ...) are built with the host
+# compiler (clang) and linked with the host linker. Two problems force us to
+# steer clear of the toolchain-bundled ld.lld for host links:
+#
+#   1. ld.lld >= 13 is strict about PIE/PIC: objects compiled without -fPIC
+#      fail with "R_X86_64_32 cannot be used against local symbol;
+#      recompile with -fPIC" when used in a final executable link. Kbuild
+#      doesn't pass -fPIC for these host programs.
+#
+#   2. The toolchain-bundled x86 GNU ld (azure 2.37, proton 2.36, neutron-18
+#      2.40) cannot read modern system libraries that use SHT_RELR
+#      (.relr.dyn, "unknown type [0x13]") or .sframe.
+#
+# Both problems go away if we link host programs with the SYSTEM GNU ld
+# (Arch: binutils 2.47). When /usr/bin/ld exists we always prefer it. If
+# not (some container / distro setups), we fall back to ld.lld and accept
+# the PIC requirement.
+#
+# We never override this for san-gcc -- gcc's collect2 honors the LD env
+# and the toolchain ships a current GNU ld, so it's fine to keep the
+# toolchain default.
+if [[ $TOOLCHAIN_TYPE == "CLANG" ]]; then
+    if [[ -x /usr/bin/ld ]]; then
+        # Filter out any HOSTLD=ld.lld / HOSTLDFLAGS=-fuse-ld=lld that
+        # some prior block may have set, then apply the system ld override.
+        FILTERED=()
+        for arg in "${MAKE_ARGS[@]}"; do
+            case $arg in
+                HOSTLD=ld.lld|HOSTLDFLAGS=-fuse-ld=lld)
+                    ;;  # we'll set HOSTLDFLAGS ourselves
+                *)
+                    FILTERED+=("$arg")
+                    ;;
+            esac
+        done
+        MAKE_ARGS=("${FILTERED[@]}")
+        MAKE_ARGS+=(HOSTLD=/usr/bin/ld HOSTLDFLAGS=--ld-path=/usr/bin/ld)
+        log "Host link: using system /usr/bin/ld (auto-detected)"
+    else
+        warn "Host link: /usr/bin/ld not found; falling back to ld.lld"
+    fi
+fi
+
+# Linker selection by kernel generation.
+# ld.lld cannot infer the target emulation on pre-4.14 kernels (their Kbuild
+# does not pass -m to the linker), which fails relocatable links of empty
+# built-in.o with: "target emulation unknown". Those kernels also predate
+# full LLVM= support. So for kernels < 4.14 built with a clang toolchain,
+# drop the lld linker flags and LLVM=1, and link with the bundled GNU ld
+# (via CROSS_COMPILE) while still compiling C with clang.
+if [[ $KERNEL_MAJOR -eq 4 && $KERNEL_MINOR -lt 14 ]]; then
+    FILTERED_ARGS=()
+    for arg in "${MAKE_ARGS[@]}"; do
+        case $arg in
+            LD=ld.lld|HOSTLD=ld.lld|HOSTLDFLAGS=-fuse-ld=lld|LLVM=1)
+                ;;  # drop lld / LLVM=1 entries for old kernels (clang only)
+            *)
+                FILTERED_ARGS+=("$arg")
+                ;;
+        esac
+    done
+    MAKE_ARGS=("${FILTERED_ARGS[@]}")
+
+    # System host ld for host links (dtc, fixdep). On 4.4 the host-csingle
+    # rule (used for fixdep) does NOT pass $(HOSTLDFLAGS) -- only
+    # $(hostc_flags) -- so the linker choice must ride in HOSTCFLAGS for
+    # clang toolchains. For gcc toolchains HOSTLDFLAGS works normally and
+    # we don't need to bake the ld-path into HOSTCFLAGS.
+    # The universal host-link block above already sets HOSTLD/HOSTLDFLAGS
+    # for clang; we just need to mirror HOSTLDFLAGS into HOSTCFLAGS so the
+    # host-csingle rule sees it.
+    HOST_LD_FLAG=""
+    if [[ -x /usr/bin/ld ]]; then
+        HOST_LD_FLAG="--ld-path=/usr/bin/ld"
+    fi
+    # -fcommon: kernels <4.4.250 expect tentative defs to merge; modern
+    # clang/GCC default -fno-common and so reject dtc's yylloc multi-def.
+    if [[ $TOOLCHAIN_TYPE == "CLANG" ]]; then
+        MAKE_ARGS+=(
+            HOSTCFLAGS="-Wall -Wstrict-prototypes -O2 -fomit-frame-pointer -std=gnu89 -fcommon -Qunused-arguments $HOST_LD_FLAG"
+            HOSTCXXFLAGS="-O2 -fcommon -Qunused-arguments $HOST_LD_FLAG"
+        )
+    else
+        # GCC path: HOSTCC=gcc, HOSTCXX=g++. The host-csingle rule on 4.4
+        # (used for fixdep) does NOT pass $(HOSTLDFLAGS) at all -- only
+        # $(hostc_flags) -- so the linker/assembler choice must ride in
+        # HOSTCFLAGS to reach every host link.
+        #
+        # gcc honors `-B<prefix>` (prepended to tool search path) and
+        # `HOSTLD` (for rules that consult it), but NOT `-fuse-ld=<path>`
+        # nor `LD=<path>` env. We do NOT pass clang-only flags
+        # (-Qunused-arguments) or gcc rejects them.
+        HOSTPATH_GCC=""
+        [[ -x /usr/bin/ld ]] && HOSTPATH_GCC="-B/usr/bin"
+        HOSTLD_GCC=""
+        [[ -x /usr/bin/ld ]] && HOSTLD_GCC="/usr/bin/ld"
+        # Bake -B/usr/bin into BOTH HOSTCFLAGS (single-file rule) and
+        # HOSTLDFLAGS (multi-file rule). Both rules consult HOSTCFLAGS or
+        # HOSTLDFLAGS depending on the rule; we need both.
+        MAKE_ARGS+=(
+            HOSTLDFLAGS="$HOSTPATH_GCC"
+            HOSTCFLAGS="-Wall -Wstrict-prototypes -O2 -fomit-frame-pointer -std=gnu89 -fcommon $HOSTPATH_GCC"
+            HOSTCXXFLAGS="-O2 -fcommon $HOSTPATH_GCC"
+        )
+        if [[ -n $HOSTLD_GCC ]]; then
+            MAKE_ARGS+=(HOSTLD="$HOSTLD_GCC")
+            log "Kernel < 4.14 + gcc: HOSTCFLAGS/HOSTLDFLAGS '$HOSTPATH_GCC'; -fcommon applied"
+        else
+            log "Kernel < 4.14 + gcc: -fcommon applied; system /usr/bin/ld not found"
+        fi
+    fi
+
+    # For clang toolchains: drop ld.lld and steer clang's external assembler
+    # / linker lookups at the system aarch64 toolchain when available.
+    #
+    # Why: Kbuild 4.4 hard-injects `--prefix=<toolchain>/bin` into
+    # CLANG_FLAGS. When clang then needs the external `as` (for .S or
+    # certain vdso inline asm) it finds the bundled x86 GNU as under that
+    # prefix, which can't decode `-EL`. We override --prefix (and
+    # --gcc-toolchain) via KCFLAGS/KAFLAGS, which Kbuild 4.4 appends to
+    # KBUILD_CFLAGS/KBUILD_AFLAGS after CLANG_FLAGS -- last flag wins, so
+    # clang resolves to the right as.
+    #
+    # When the system aarch64 toolchain (aarch64-linux-gnu-{as,ld,gcc}) is
+    # available, prefer it; otherwise fall back to the toolchain's bundled
+    # aarch64 binutils (which exists in azure/proton/neutron-18 but not in
+    # plain "neutron").
+    if [[ $TOOLCHAIN_TYPE == "CLANG" ]]; then
+        MAKE_ARGS+=(LD=aarch64-linux-gnu-ld)
+        log "Kernel < 4.14 + clang: using GNU ld (aarch64-linux-gnu-ld) + system aarch64 as"
+        if [[ -x /usr/bin/aarch64-linux-gnu-as && -x /usr/bin/aarch64-linux-gnu-ld ]]; then
+            # Kbuild 4.4 injects `--prefix=<toolchain>/bin` and
+            # `--gcc-toolchain=<toolchain>` into CLANG_FLAGS. We append
+            # `-B/usr/aarch64-linux-gnu/bin` via KCFLAGS/KAFLAGS so the
+            # EXTRA -B is searched for `as`/`ld` first; Kbuild 4.4's
+            # order: CLANG_FLAGS then KCFLAGS, last -B wins.
+            SYSTEM_AARCH64_BIN="/usr/aarch64-linux-gnu/bin"
+            [[ -d $SYSTEM_AARCH64_BIN ]] || SYSTEM_AARCH64_BIN="/usr/bin"
+            MAKE_ARGS+=(
+                KCFLAGS="-B$SYSTEM_AARCH64_BIN --gcc-toolchain=/usr -fno-strict-aliasing"
+                KAFLAGS="-B$SYSTEM_AARCH64_BIN --gcc-toolchain=/usr"
+            )
+            log "  asm/ld: system aarch64 ($SYSTEM_AARCH64_BIN)"
+        elif [[ -x $TOOLCHAIN_DIR/aarch64-linux-gnu-as ]]; then
+            MAKE_ARGS+=(
+                KCFLAGS="--prefix=$TOOLCHAIN_DIR/.. --gcc-toolchain=$(realpath "$TOOLCHAIN_DIR/.." 2>/dev/null || dirname "$TOOLCHAIN_DIR")"
+                KAFLAGS="--prefix=$TOOLCHAIN_DIR/.. --gcc-toolchain=$(realpath "$TOOLCHAIN_DIR/.." 2>/dev/null || dirname "$TOOLCHAIN_DIR")"
+            )
+            log "  asm/ld: toolchain bundled aarch64 ($TOOLCHAIN_DIR)"
+        else
+            warn "  No aarch64 cross toolchain found; 'as: unrecognized -EL' will fail"
+        fi
+    else
+        # san-gcc path: handled by the HOSTCFLAGS/HOSTLDFLAGS -B/usr/bin
+        # block above; the fixes there cover yylloc (-fcommon) and host-link
+        # (HOSTCFLAGS/HOSTLDFLAGS -B/usr/bin steers gcc to system binutils).
+        log "Kernel < 4.14 + gcc: HOSTCFLAGS/HOSTLDFLAGS -B/usr/bin; -fcommon applied"
+    fi
+fi
+
+# Force host tools to be built with clang for all LLVM toolchains.
+# On older kernels (e.g. 4.4) HOSTCC defaults to the system gcc, which on
+# modern hosts emits directives (e.g. .base64 from GCC 15) that the
+# toolchain's bundled/older GNU `as` cannot assemble. Building host tools
+# with clang's integrated assembler avoids this host/toolchain mismatch.
+if [[ $TOOLCHAIN_TYPE == "CLANG" ]]; then
+    if [[ $USE_CCACHE == true ]]; then
+        MAKE_ARGS+=(HOSTCC="ccache clang" HOSTCXX="ccache clang++")
+    else
+        MAKE_ARGS+=(HOSTCC=clang HOSTCXX=clang++)
+    fi
+fi
+
+# Add the resolved 32-bit compiler make variable (correct one for this
+# kernel generation). For kernels < 4.14 this is CROSS_COMPILE_ARM32;
+# for 4.14+ it is CROSS_COMPILE_COMPAT.
+if [[ -n "$ARM32_COMPILE_VAR" ]]; then
+    MAKE_ARGS+=("$ARM32_COMPILE_VAR=$ARM32_COMPILE_VAL")
+fi
+
+# Add Werror flag if requested
+if [[ $WERROR == true ]]; then
+    MAKE_ARGS+=(KCFLAGS="-Werror")
+    log "Treating warnings as errors (KCFLAGS=-Werror)"
+fi
 
 log "Starting build..."
 echo "  ARCH=arm64"
@@ -474,6 +762,14 @@ if [[ $CONTINUE_BUILD == false ]]; then
         scripts/kconfig/merge_config.sh -m -r -O "$OUT_DIR" "arch/arm64/configs/$DEFCONFIG" "arch/arm64/configs/$FRAGMENT"
     else
         make "${MAKE_ARGS[@]}" "$DEFCONFIG"
+    fi
+
+    # Disable the 32-bit vDSO when no 32-bit gcc is available, so the build
+    # does not hit the hard $(error) in arch/arm64/Makefile (kernels < 4.14)
+    # or silently skip the vDSO (4.14+).
+    if [[ -n $VDSO_DISABLE_CONFIG ]]; then
+        log "Disabling $VDSO_DISABLE_CONFIG (no 32-bit gcc)"
+        ./scripts/config --file "$OUT_DIR/.config" --disable "$VDSO_DISABLE_CONFIG"
     fi
 
     make "${MAKE_ARGS[@]}" olddefconfig

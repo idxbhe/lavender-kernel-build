@@ -12,7 +12,6 @@ getinfo/
 lavender.json
 lavender.log
 san_scripts/
-*.txt
 *.log
 *.json
 *.zip
@@ -22,3 +21,4 @@ kernels/
 *-dtb
 __pycache__
 boots/
+*.bak

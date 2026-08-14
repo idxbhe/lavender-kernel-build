@@ -13,6 +13,8 @@ Flags:
     --include-optional  : include optional configurations (UFW/Fail2ban, USER_NS, TMPFS_XATTR, etc.)
     --skip-patch        : skip patching step, only configure defconfig
     --dry-run           : show what would be done without making changes
+    --verbose, -v       : verbose Kconfig symbol resolution notes (use when adding fallbacks)
+    --backup            : create a .bak copy of the defconfig before editing (opt-in; default: no backup)
 """
 
 import argparse
@@ -22,6 +24,16 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+# Manual patch engine import (robust, no external .patch dependency)
+try:
+    import importlib.util
+    _mpe_path = Path(__file__).resolve().parent / "manual_patch_engine.py"
+    _spec = importlib.util.spec_from_file_location("manual_patch_engine", str(_mpe_path))
+    _manual_engine = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_manual_engine)
+except Exception:
+    _manual_engine = None
 
 # ============================================================
 #  CONFIG DATA — sourced from Kernel-Configuration.md
@@ -54,7 +66,10 @@ MANDATORY_NON_GKI = [
     ("CONFIG_TMPFS_XATTR", "y", "Filesystem"),
     ("CONFIG_FW_LOADER", "y", "Firmware"),
     ("CONFIG_FW_LOADER_USER_HELPER", "y", "Firmware"),
-    ("CONFIG_FW_LOADER_COMPRESS", "y", "Firmware"),
+    # NOTE: CONFIG_FW_LOADER_COMPRESS is intentionally NOT in MANDATORY_NON_GKI.
+    # It only exists on 5.x+. For older kernels we don't enable firmware
+    # compression. If we later discover we need it, add to a kernel-version-
+    # gated list rather than as a hard mandatory.
     ("CONFIG_NET_NS", "y", "Network"),
     ("CONFIG_VETH", "y", "Network"),
     ("CONFIG_BRIDGE", "y", "Network"),
@@ -66,11 +81,10 @@ MANDATORY_NON_GKI = [
     ("CONFIG_IP_NF_FILTER", "y", "Network"),
     ("CONFIG_NF_NAT", "y", "Network"),
     ("CONFIG_NF_TABLES", "y", "Network"),
-    ("CONFIG_IP_NF_TARGET_MASQUERADE", "y", "Network"),
-    ("CONFIG_NETFILTER_XT_TARGET_MASQUERADE", "y", "Network"),
+    ("CONFIG_NETFILTER_XT_TARGET_MASQUERADE", "y", "Network"),  # fallback to IP_NF_TARGET_MASQUERADE on 4.4 via FALLBACK_SYMBOLS
     ("CONFIG_NETFILTER_XT_TARGET_TCPMSS", "y", "Network"),
     ("CONFIG_NETFILTER_XT_MATCH_ADDRTYPE", "y", "Network"),
-    ("CONFIG_NF_CONNTRACK_NETLINK", "y", "Network"),
+    ("CONFIG_NF_CONNTRACK_NETLINK", "y", "Network"),  # fallback to NF_CT_NETLINK on 4.4 via FALLBACK_SYMBOLS
     ("CONFIG_NF_NAT_REDIRECT", "y", "Network"),
     ("CONFIG_IP_ADVANCED_ROUTER", "y", "Network"),
     ("CONFIG_IP_MULTIPLE_TABLES", "y", "Network"),
@@ -162,8 +176,13 @@ PATCH_GKI_ABOVE_612 = [
 #  UTILS
 # ==============================================
 
+_VERBOSE = False  # set by --verbose flag in main()
+
+
 def log(s: str, level: str = "info"):
-    tag = {"info":"[INFO]", "warn":"[WARN]", "error":"[ERROR]", "ok":"[OK]"}.get(level, "[INFO]")
+    if level == "verbose" and not _VERBOSE:
+        return
+    tag = {"info":"[INFO]", "warn":"[WARN]", "error":"[ERROR]", "ok":"[OK]", "verbose":"[VRBS]"}.get(level, "[INFO]")
     print(f"{tag} {s}")
 
 
@@ -249,6 +268,224 @@ def find_config_line(lines: list[str], name: str) -> int:
     return -1
 
 
+# ============================================================
+#  KCONFIG SYMBOL DETECTION (dynamic, verbose, multilevel-fallback)
+#
+#  Workflow per simbol:
+#    1. cek Kconfig untuk simbol primary
+#    2. jika ada → pakai primary
+#    3. jika tidak ada → cek fallback chain (ordered list, recursive)
+#    4. jika ada yang match di chain → pakai yang pertama match
+#    5. jika seluruh chain exhausted:
+#       a. jika simbol ada di VERIFIED_UNSUPPORTED → SKIP dengan catatan
+#       b. jika tidak → THROW SymbolResolutionError
+#
+#  Tujuannya: tidak ada auto-skip diam-diam untuk config WAJIB.
+#  Saat menemukan entry baru yang belum terverifikasi, user HARUS
+#  menyelidiki (lihat pesan error verbose) lalu mengisi:
+#    - Fallback chain (jika ada alternatif di kernel modern/lama)
+#    - atau VERIFIED_UNSUPPORTED (jika memang terbukti tidak ada
+#      alternatif untuk simbol wajib tersebut di kernel tertentu)
+# ============================================================
+
+
+class SymbolResolutionError(Exception):
+    """Raised when a mandatory config symbol cannot be resolved to any
+    existing Kconfig symbol, AND it has not been declared in
+    VERIFIED_UNSUPPORTED. This is by design: the script refuses to silently
+    skip a mandatory symbol so the user investigates."""
+
+    def __init__(self, symbol, attempted_chain):
+        self.symbol = symbol
+        self.attempted_chain = attempted_chain  # list of strings
+        msg = (
+            f"Cannot resolve mandatory config '{symbol}'. Attempted chain: "
+            f"{attempted_chain}. If you have verified that none of these "
+            f"symbols exist in this kernel AND no alternative exists, add "
+            f"'{symbol}' to VERIFIED_UNSUPPORTED (with kernel context) to "
+            f"explicitly acknowledge the skip."
+        )
+        super().__init__(msg)
+
+
+# Multilevel fallback chain: each entry is a list (chain) of candidate
+# symbols. The resolver tries each chain in order; within a chain, the
+# first Kconfig-present symbol wins.
+#
+# Example: for NF_CONNTRACK_NETLINK, on newer kernels it's the primary.
+# On 4.4 it was renamed NF_CT_NETLINK — so chain A = ["NF_CT_NETLINK"].
+# If we discover a 3.18 variant later, add chain B = ["SOMETHING_3_18"].
+FALLBACK_SYMBOLS: dict = {
+    "CONFIG_NF_CONNTRACK_NETLINK": [
+        ["CONFIG_NF_CT_NETLINK"],  # 4.4 renamed it
+    ],
+    "CONFIG_NETFILTER_XT_TARGET_MASQUERADE": [
+        ["CONFIG_IP_NF_TARGET_MASQUERADE"],  # 4.4: iptables-only MASQUERADE
+    ],
+    "CONFIG_NETFILTER_XT_TARGET_REJECT": [
+        ["CONFIG_IP_NF_TARGET_REJECT"],  # 4.x: iptables-only REJECT (xt alias removed)
+    ],
+    # CONFIG_FW_LOADER_COMPRESS added in 5.x; deliberately not in MANDATORY
+    # list (see comment there). If you add it back, register a fallback here.
+}
+
+
+# Symbols whose absence we have VERIFIED (i.e., user has personally checked
+# the Kconfig tree and confirmed there is no alternative). Add entries here
+# only after manual investigation. The value is a free-form note explaining
+# the rationale — it is printed at runtime for transparency.
+#
+# Format: { "CONFIG_FOO": "kernel-version-range: reason" }
+# Example:
+#   VERIFIED_UNSUPPORTED = {
+#       "CONFIG_FW_LOADER_COMPRESS": "all pre-5.x: symbol did not exist; "
+#       "no iptables-level fallback for firmware compression",
+#   }
+#
+# Real entries (verified on stormbreaker 4.19-stable, 4.4 rave44, and current
+# Droidspaces docs):
+#   - NF_CONNTRACK_IPV4: in 4.19+ the symbol was merged into NF_CONNTRACK
+#     itself (no separate ipv4 conntrack Kconfig exists). Functionality is
+#     already enabled by CONFIG_NF_CONNTRACK=y. Verified via:
+#       grep -n "^config NF_CONNTRACK_IPV4" \
+#         net/netfilter/Kconfig net/ipv4/netfilter/Kconfig
+#     → no matches on 4.19; on 4.4 the symbol also does not appear in Kconfig
+#     (NF_CONNTRACK_IPV4 there was a silent alias handled by select chains).
+VERIFIED_UNSUPPORTED: dict = {
+    "CONFIG_NF_CONNTRACK_IPV4": (
+        "4.19+ (and modern kernels): symbol merged into CONFIG_NF_CONNTRACK "
+        "(verified: no `config NF_CONNTRACK_IPV4` in net/netfilter/Kconfig or "
+        "net/ipv4/netfilter/Kconfig on 4.19.195). Functionality is covered "
+        "by CONFIG_NF_CONNTRACK=y, which is already in MANDATORY_NON_GKI."
+    ),
+    "CONFIG_IP_NF_TARGET_ULOG": (
+        "4.19+ (and modern kernels): ipt_ULOG was obsoleted by nf_log. "
+        "(verified: no `config IP_NF_TARGET_ULOG` in net/ipv4/netfilter/Kconfig "
+        "on 4.19.195; NF_LOG-based logging via CONFIG_NETFILTER_XT_TARGET_NFLOG "
+        "is the replacement and is already in OPTIONAL_NON_GKI.)"
+    ),
+    "CONFIG_ANDROID_PARANOID_NETWORK": (
+        "4.19 Xiaomi forks (e.g. sw-ng, vendor-modified) may strip the "
+        "ANDROID_PARANOID_NETWORK symbol entirely. Since this entry requests "
+        "`=n` (we want to disable the per-app network permission), absence "
+        "of the symbol is functionally equivalent to our intent: the "
+        "paranoid network check is not compiled in, so it cannot be enabled. "
+        "Skipping here is therefore safe and a no-op. "
+        "(Verified on sw-ng 4.19.325: no ANDROID_PARANOID_NETWORK in any "
+        "Kconfig*. Same symbol IS present on stock kernels like rave44 "
+        "4.4.302 and stormbreaker 4.19.195, so the symbol is not universally "
+        "absent — only on stripped vendor forks.)"
+    ),
+}
+
+
+# Cache Kconfig symbol presence per src_path to avoid repeated scans
+_KCONFIG_SYMBOL_CACHE: dict = {}
+
+
+def kconfig_scan_files(src_path):
+    """Return list of Kconfig / Kconfig.* files under src_path."""
+    cache_key = str(src_path.resolve())
+    if cache_key in _KCONFIG_SYMBOL_CACHE and isinstance(_KCONFIG_SYMBOL_CACHE[cache_key], list):
+        return _KCONFIG_SYMBOL_CACHE[cache_key]
+    kcfiles = []
+    try:
+        # Limit depth to keep it fast on huge trees
+        for p in src_path.rglob("Kconfig*"):
+            # Only Kconfig (driver/kdb/Kconfig) — but match patterns like Kconfig.foo and Kconfig
+            # as well as plain Kconfig. Common practice: Kconfig or Kconfig.<subdir>
+            if p.is_file() and p.parent.name not in (".git",):
+                kcfiles.append(p)
+    except Exception:
+        pass
+    _KCONFIG_SYMBOL_CACHE[cache_key] = kcfiles
+    return kcfiles
+
+
+def kconfig_has_symbol(src_path, symbol_name):
+    """Return True if `symbol_name` (CONFIG_XXX or XXX) is declared in any Kconfig* under src_path.
+    Uses a regex that matches:
+        config <NAME>
+    at line start (after optional whitespace).
+    Cached per src_path."""
+    cache_key = (str(src_path.resolve()), symbol_name)
+    if cache_key in _KCONFIG_SYMBOL_CACHE:
+        return _KCONFIG_SYMBOL_CACHE[cache_key]
+    # Strip CONFIG_ prefix to match Kconfig's `config FOO` / `menuconfig FOO` syntax
+    bare = symbol_name[len("CONFIG_"):] if symbol_name.startswith("CONFIG_") else symbol_name
+    # Match either `config FOO` or `menuconfig FOO` (Kconfig syntax)
+    pat = re.compile(r"^\s*(?:menu)?config\s+" + re.escape(bare) + r"\s*$", re.MULTILINE)
+    found = False
+    for kf in kconfig_scan_files(src_path):
+        try:
+            text = kf.read_text(errors="ignore")
+        except Exception:
+            continue
+        if pat.search(text):
+            found = True
+            break
+    _KCONFIG_SYMBOL_CACHE[cache_key] = found
+    return found
+
+
+def resolve_symbol_for_kernel(src_path, cfg_name, allow_skip=False):
+    """Resolve a desired CONFIG_XXX to an actually-existing symbol.
+    Returns:
+        (chosen_cfg, was_fallback, log_notes)
+    where chosen_cfg may equal cfg_name, be a fallback, or be None.
+    Raises SymbolResolutionError if no symbol can be resolved and the
+    symbol is mandatory (allow_skip=False) AND not in VERIFIED_UNSUPPORTED.
+    """
+    notes = []
+    attempted = []  # ordered list of symbols tried
+
+    # Step 1: primary
+    attempted.append(cfg_name)
+    if kconfig_has_symbol(src_path, cfg_name):
+        return cfg_name, False, notes
+
+    notes.append(f"symbol '{cfg_name}' not declared in any Kconfig")
+
+    # Step 2-4: walk all fallback chains (multilevel)
+    chains = FALLBACK_SYMBOLS.get(cfg_name, [])
+    # Normalize: accept legacy flat-list FALLBACK_SYMBOLS entries too
+    # (legacy: list of strings => treated as a single chain)
+    normalized_chains = []
+    for ch in chains:
+        if isinstance(ch, str):
+            normalized_chains.append([ch])
+        else:
+            normalized_chains.append(list(ch))
+
+    for chain_idx, chain in enumerate(normalized_chains):
+        for fb in chain:
+            attempted.append(fb)
+            if kconfig_has_symbol(src_path, fb):
+                notes.append(
+                    f"fallback chain #{chain_idx+1}: using '{fb}' "
+                    f"instead of '{cfg_name}'"
+                )
+                return fb, True, notes
+            notes.append(f"fallback candidate '{fb}' also not declared")
+
+    # Step 5: chain exhausted
+    if cfg_name in VERIFIED_UNSUPPORTED:
+        note = (f"symbol '{cfg_name}' verified unsupported: "
+                f"{VERIFIED_UNSUPPORTED[cfg_name]} -> SKIP (explicit)")
+        notes.append(note)
+        return None, False, notes
+
+    if allow_skip:
+        notes.append(
+            f"all fallbacks exhausted for '{cfg_name}' but --allow-skip "
+            f"is set -> SKIP"
+        )
+        return None, False, notes
+
+    # Strict: throw so the user investigates.
+    raise SymbolResolutionError(cfg_name, attempted)
+
+
 def modify_config_line(line: str, value: str) -> str:
     """Replace value in a config line, preserving whitespace and comments in line.
     Handles:
@@ -274,16 +511,32 @@ def modify_config_line(line: str, value: str) -> str:
         return line.replace(stripped, f"{name}={value}")
 
 
-def apply_defconfig_changes(path: Path, configs: list[tuple[str, str, str]], dry_run: bool = False) -> list[dict]:
+def apply_defconfig_changes(path: Path, configs: list[tuple[str, str, str]], src_path: Path = None, dry_run: bool = False, allow_skip: bool = False) -> list[dict]:
     """Apply a list of (CONFIG, value, group_name) to defconfig.
     Returns list of applied changes (each dict with key/value/action/group).
     Idempotent: skips if already correct.
     """
     if dry_run:
         log("Dry-run: would check/edit defconfig but no file will be written.")
+    if src_path is None:
+        src_path = path.parent.parent.parent  # assume .../arch/arm64/configs
     lines = read_defconfig(path)
     applied = []
     for cfg_name, cfg_value, group in configs:
+        # Dynamic Kconfig symbol resolution (no hardcode per-kernel).
+        # By default this raises SymbolResolutionError for mandatory symbols
+        # with no fallback; pass allow_skip=True to override (dev mode).
+        chosen, was_fallback, notes = resolve_symbol_for_kernel(
+            src_path, cfg_name, allow_skip=allow_skip
+        )
+        for note in notes:
+            log(note, "verbose")
+        if chosen is None:
+            applied.append({"key": cfg_name, "value": cfg_value, "action": "skipped-missing", "group": group, "notes": notes})
+            continue
+        if was_fallback:
+            log(f"resolved '{cfg_name}' -> '{chosen}' (fallback)", "info")
+        cfg_name = chosen
         idx = find_config_line(lines, cfg_name)
         current_line = lines[idx] if idx >= 0 else None
         current_value = None
@@ -501,7 +754,9 @@ def apply_all_patches(src_path: Path, is_gki_flag: bool, dry_run: bool, skip_pat
     }
 
 
-def backup_defconfig(path: Path):
+def backup_defconfig(path: Path) -> Path:
+    """Create a .bak copy of defconfig if it does not already exist.
+    Caller decides whether to invoke this (opt-in via --backup)."""
     backup_path = Path(str(path) + ".bak")
     if not backup_path.exists():
         shutil.copy2(path, backup_path)
@@ -525,7 +780,18 @@ def main():
     parser.add_argument("--include-optional", action="store_true", help="Include optional configurations (UFW, Fail2ban, USER_NS, TMPFS_XATTR, TMPFS_POSIX_ACL, etc.)")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be done without making changes.")
     parser.add_argument("--skip-patch", action="store_true", help="Skip patching step, only configure defconfig.")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose Kconfig resolution notes (use when adding fallbacks).")
+    parser.add_argument("--allow-skip-unresolved", action="store_true",
+                        help="If a mandatory symbol cannot be resolved and is not "
+                             "in VERIFIED_UNSUPPORTED, skip it instead of erroring. "
+                             "Use only during initial development; the strict default "
+                             "forces you to add a fallback or explicit verification.")
+    parser.add_argument("--backup", action="store_true",
+                        help="Create a .bak copy of the defconfig before editing. "
+                             "Backup is opt-in: by default no backup is created.")
     args = parser.parse_args()
+    global _VERBOSE
+    _VERBOSE = args.verbose
 
     # Validate paths
     src_path = Path(args.kernel_source).resolve()
@@ -553,8 +819,11 @@ def main():
     gki = is_gki(src_path)
     log(f"GKI mode detected: {gki}")
 
-    # Resolve patches for this kernel
-    patch_results = apply_all_patches(src_path, gki, args.dry_run, args.skip_patch)
+    # Resolve patches for this kernel (manual engine, robust across versions)
+    if _manual_engine is not None:
+        patch_results = _manual_engine.apply_all_manual_patches(src_path, gki, args.dry_run, args.skip_patch)
+    else:
+        patch_results = apply_all_patches(src_path, gki, args.dry_run, args.skip_patch)
 
     # Print patch results clearly
     for res in patch_results.get("results", []):
@@ -579,11 +848,17 @@ def main():
             configs_to_apply.extend(OPTIONAL_NON_GKI)
 
     # Apply defconfig edits
-    # Always make a backup (unless dry-run, but we don't actually write in dry-run)
-    if not args.dry_run:
+    # Backup defconfig (opt-in via --backup; dry-run never writes)
+    if args.backup and not args.dry_run:
         backup_defconfig(defconfig_path)
+    elif not args.backup and not args.dry_run:
+        log("Backup skipped (use --backup to create a .bak copy)", "info")
 
-    changes = apply_defconfig_changes(defconfig_path, configs_to_apply, dry_run=args.dry_run)
+    changes = apply_defconfig_changes(
+        defconfig_path, configs_to_apply,
+        src_path=src_path, dry_run=args.dry_run,
+        allow_skip=args.allow_skip_unresolved,
+    )
 
     # Print results
     if changes:
